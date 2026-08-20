@@ -60,86 +60,15 @@ mod kernels {
             // Sobel horizontal and vertical gradients.
             let gx = -top_left + top_right - 2.0 * left + 2.0 * right - bottom_left + bottom_right;
             let gy = -top_left - 2.0 * top - top_right + bottom_left + 2.0 * bottom + bottom_right;
-            *grad_x_out = gx;
-            *grad_y_out = gy;
+            *grad_x = gx;
+            *grad_y = gy;
             
             // Store continuous edge strength for the next thinning stage.
             let strength = gx.abs() + gy.abs();
             *edge = strength.min(1.0);
         }
     }
-
-    #[kernel]
-    pub fn non_maximum_suppression(
-        edges: &[f32],
-        grad_x: &[f32],
-        grad_y: &[f32],
-        mut thin_edges: DisjointSlice<f32>,
-        w: usize,
-        h: usize,
-    ) {
-        if let Some((thin_edge, idx)) = thin_edges.get_mut_indexed() {
-            let i = idx.get();
-            let x = i % w;
-            let y = i / w;
-
-            // Borders have no complete neighbourhood.
-            if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
-                *thin_edge = 0.0;
-                return;
-            }
-
-            let gx = grad_x[i];
-            let gy = grad_y[i];
-            let current = edges[i];
-
-            // Pick the two neighbours along the closest gradient direction.
-            let (before, after) = if gx.abs() >= gy.abs() {
-                if gy.abs() * 2.0 <= gx.abs() {
-                    (i - 1, i + 1) // horizontal
-                } else if gx * gy >= 0.0 {
-                    (i - w - 1, i + w + 1) // northwest ↔ southeast
-                } else {
-                    (i - w + 1, i + w - 1) // northeast ↔ southwest                                
-                }
-            } else if gx.abs() * 2.0 <= gy.abs() {
-                (i - w, i + w) // vertical
-            } else if gx * gy >= 0.0 {
-                (i - w - 1, i + w + 1) // northwest ↔ southeast
-            } else {
-                (i - w + 1, i + w - 1) // northeast ↔ southwest
-            };
-
-            // Keep only local maxima; suppress every other edge pixel.
-            *thin_edge = if current >= edges[before] && current >= edges[after] {
-                current
-            } else {
-                0.0
-            };
-        }
-    } 
-
-    #[kernel]
-    pub fn double_threshold(
-	thin_edges: &[f32],
-	mut edge_classes: DisjointSlice<f32>,
-	low_threshold: f32,
-	high_threshold: f32,
-    ) {
-	if let Some((edge_class, idx)) = edge_classes.get_mut_indexed() {
-	    let strength = thin_edges[idx.get()];
-
-	    // 0.0 = no edge, 0.5 = weak edge, 1.0 = strong edge.
-	    *edge_class = if strength >= high_threshold {
-		1.0
-	    } else if strength >= low_threshold {
-		0.5
-	    } else {
-		0.0
-	    };
-	}
-    }
-} 
+}
 
 fn main() {
     // Initialize CUDA
@@ -148,8 +77,6 @@ fn main() {
     // Init CUDA streams
     let grayscale_stream = ctx.new_stream().expect("Failed to create grayscale stream");
     let edge_stream = ctx.new_stream().expect("Failed to create edge stream");
-    let nms_stream = ctx.new_stream().expect("Failed to create nms stream");
-    let threshold_stream = ctx.new_stream().expect("Failed to create threshold stream");
 
     // Load an image
     let img = ImageReader::open("assets/circle.jpg")
@@ -165,8 +92,6 @@ fn main() {
     let rgba_dev = DeviceBuffer::from_host(&grayscale_stream, rgba.as_raw()).unwrap();
     let mut grayscale_dev = DeviceBuffer::<f32>::zeroed(&grayscale_stream, N).unwrap();
     let mut edges_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
-    let mut thin_edges_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
-    let mut edge_classes_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
 
     let mut grad_x_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
     let mut grad_y_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
@@ -195,6 +120,8 @@ fn main() {
         .wait(&grayscale_done)
         .expect("Failed to wait for grayscale event");
 
+    let threshold = 0.01;
+
     // Launch the edge detection kernel.
     unsafe {
         module.edge_detect(
@@ -209,92 +136,29 @@ fn main() {
         )
     }
     .expect("Edge detect kernal launch failed");
-    
-    // Record when the edge kernal has completed its work.
-    let edge_done = edge_stream
-        .record_event(None)
-        .expect("Failed to record edge event");
-
-    // Do not run nms until edge is complete.
-    nms_stream
-        .wait(&edge_done)
-        .expect("Failed to wait for edge event");
-
-    // Launch the nms kernel.
-    unsafe {
-        module.non_maximum_suppression(
-            &nms_stream,
-            LaunchConfig::for_num_elems(N as u32),
-            &edges_dev,
-            &grad_x_dev,
-            &grad_y_dev,
-            &mut thin_edges_dev,
-            w,
-            h,
-        )
-    }
-    .expect("Edge detect kernal launch failed");
-    
-    // Record when the nms kernal has completed its work.
-    let nms_done = nms_stream
-        .record_event(None)
-        .expect("Failed to record nms event");
-
-    // Do not run nms until edge is complete.
-    threshold_stream
-        .wait(&nms_done)
-        .expect("Failed to wait for nms event");
-
-    let low_threshold: f32 = 0.03;
-    let high_threshold: f32 = 0.06;
-
-    // Launch the threshold kernel.
-    unsafe {
-        module.double_threshold(
-            &threshold_stream,
-            LaunchConfig::for_num_elems(N as u32),
-            &thin_edges_dev,
-            &mut edge_classes_dev,
-            low_threshold,
-            high_threshold,
-        )
-    }
-    .expect("Threshold kernal launch failed");
 
     // Get the results
     let grayscale_host = grayscale_dev.to_host_vec(&grayscale_stream).unwrap();
     let edges_host = edges_dev.to_host_vec(&edge_stream).unwrap();
-    let thin_edges_host = thin_edges_dev.to_host_vec(&nms_stream).unwrap();
-    let edge_classes_host = edge_classes_dev.to_host_vec(&threshold_stream).unwrap();
-
-    println!("Thin-edge max: {}", thin_edges_host.iter().copied().fold(0.0_f32, f32::max));
 
     // Convert float output to grayscale bytes and save png
-    let grayscale: Vec<u8> = normalized_f32_to_u8(&grayscale_host, 1.0);
-    let edges: Vec<u8> = normalized_f32_to_u8(&edges_host, 1.0);
-    let thin_edges: Vec<u8> = normalized_f32_to_u8(&thin_edges_host, 12.0);
-    let edge_classes: Vec<u8> = normalized_f32_to_u8(&edge_classes_host, 1.0);
+    let grayscale: Vec<u8> = normalized_f32_to_u8(&grayscale_host);
+    let edges: Vec<u8> = normalized_f32_to_u8(&edges_host);
 
     let grayscale_img = image::GrayImage::from_raw(rgba.width(), rgba.height(), grayscale)
         .expect("grayscale buffer has the wrong length");
     let edges_img = image::GrayImage::from_raw(rgba.width(), rgba.height(), edges)
-        .expect("edges buffer has the wrong length");
-    let thin_edges_img = image::GrayImage::from_raw(rgba.width(), rgba.height(), thin_edges)
-        .expect("thin_edges buffer has the wrong length");
-    let edge_classes_img = image::GrayImage::from_raw(rgba.width(), rgba.height(), edge_classes)
-        .expect("edge_classes buffer has the wrong length");
+        .expect("edge buffer has the wrong length");
 
     grayscale_img.save("assets/circle-grayscale.png").unwrap();
     edges_img.save("assets/circle-edges.png").unwrap();
-    thin_edges_img.save("assets/circle-thin-edges.png").unwrap();
-    edge_classes_img.save("assets/circle-edge-classes.png").unwrap();
     
     println!("Hello, world!");
 }
 
-fn normalized_f32_to_u8(values: &[f32], gain: f32) -> Vec<u8> {
+fn normalized_f32_to_u8(values: &[f32]) -> Vec<u8> {
     values
         .iter()
-        .map(|&value| ((value * gain).clamp(0.0, 1.0) * 255.0) as u8)
+        .map(|&value| (value.clamp(0.0, 1.0) * 255.0) as u8)
         .collect()
 }
