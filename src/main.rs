@@ -58,14 +58,24 @@ mod kernels {
             let bottom_right = gray[i + w + 1];
 
             // Sobel horizontal and vertical gradients.
-            let gx = -top_left + top_right - 2.0 * left + 2.0 * right - bottom_left + bottom_right;
-            let gy = -top_left - 2.0 * top - top_right + bottom_left + 2.0 * bottom + bottom_right;
-            *grad_x_out = gx;
-            *grad_y_out = gy;
-            
-            // Store continuous edge strength for the next thinning stage.
-            let strength = gx.abs() + gy.abs();
-            *edge = strength.min(1.0);
+            // Scharr horizontal and vertical gradients.
+	    let gx = (
+		-3.0 * top_left + 3.0 * top_right
+		- 10.0 * left + 10.0 * right
+		- 3.0 * bottom_left + 3.0 * bottom_right
+	    ) / 4.0;
+
+	    let gy = (
+		-3.0 * top_left - 10.0 * top - 3.0 * top_right
+		+ 3.0 * bottom_left + 10.0 * bottom + 3.0 * bottom_right
+	    ) / 4.0;
+
+	    *grad_x_out = gx;
+	    *grad_y_out = gy;
+
+	    // Rotation-friendly L2 edge strength.
+	    let strength = (gx * gx + gy * gy).sqrt();
+	    *edge = strength.min(1.0);
         }
     }
 
@@ -139,6 +149,49 @@ mod kernels {
 	    };
 	}
     }
+
+    #[kernel]
+    pub fn hysteresis(
+	edge_classes: &[f32],
+	connected_edges: &[f32],
+	mut connected_edges_next: DisjointSlice<f32>,
+	w: usize,
+	h: usize,
+    ) {
+	if let Some((output, idx)) = connected_edges_next.get_mut_indexed() {
+	    let i = idx.get();
+	    let x = i % w;
+	    let y = i / w;
+
+	    // Strong edges and already-connected edges stay connected.
+	    if edge_classes[i] == 1.0 || connected_edges[i] == 1.0 {
+		*output = 1.0;
+		return;
+	    }
+
+	    if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
+		*output = 0.0;
+		return;
+	    }
+
+	    // Promote weak pixels that touch the previous connected result.
+	    let touches_connected =
+		connected_edges[i - w - 1] == 1.0 ||
+		connected_edges[i - w] == 1.0 ||
+		connected_edges[i - w + 1] == 1.0 ||
+		connected_edges[i - 1] == 1.0 ||
+		connected_edges[i + 1] == 1.0 ||
+		connected_edges[i + w - 1] == 1.0 ||
+		connected_edges[i + w] == 1.0 ||
+		connected_edges[i + w + 1] == 1.0;
+
+	    *output = if edge_classes[i] == 0.5 && touches_connected {
+		1.0
+	    } else {
+		0.0
+	    };
+	}
+    }
 } 
 
 fn main() {
@@ -150,9 +203,10 @@ fn main() {
     let edge_stream = ctx.new_stream().expect("Failed to create edge stream");
     let nms_stream = ctx.new_stream().expect("Failed to create nms stream");
     let threshold_stream = ctx.new_stream().expect("Failed to create threshold stream");
+    let hysteresis_stream = ctx.new_stream().expect("Failed to create hysteresis stream");
 
     // Load an image
-    let img = ImageReader::open("assets/circle.jpg")
+    let img = ImageReader::open("assets/test_tiles.png")
         .expect("unable to load image")
         .decode().expect("unable to decode image");
 
@@ -167,6 +221,8 @@ fn main() {
     let mut edges_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
     let mut thin_edges_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
     let mut edge_classes_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
+    let mut connected_edges_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
+    let mut connected_edges_next_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
 
     let mut grad_x_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
     let mut grad_y_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, N).unwrap();
@@ -245,8 +301,8 @@ fn main() {
         .wait(&nms_done)
         .expect("Failed to wait for nms event");
 
-    let low_threshold: f32 = 0.03;
-    let high_threshold: f32 = 0.06;
+    let low_threshold: f32 = 0.022;
+    let high_threshold: f32 = 0.045;
 
     // Launch the threshold kernel.
     unsafe {
@@ -261,11 +317,43 @@ fn main() {
     }
     .expect("Threshold kernal launch failed");
 
+    // Record when the threshold kernal has completed its work.
+    let threshold_done = threshold_stream
+        .record_event(None)
+        .expect("Failed to threshold edge event");
+
+    // Do not run nms until threshold is complete.
+    hysteresis_stream
+        .wait(&threshold_done)
+        .expect("Failed to wait for threshold event");
+
+    // Launch the hysteresis kernel.
+    for _ in 0..64 {
+	unsafe {
+	    module.hysteresis(
+		&hysteresis_stream,
+		LaunchConfig::for_num_elems(N as u32),
+		&edge_classes_dev,
+		&connected_edges_dev,
+		&mut connected_edges_next_dev,
+		w,
+		h,
+	    )
+	}
+	.expect("Hysteresis kernel launch failed");
+
+	std::mem::swap(
+	    &mut connected_edges_dev,
+	    &mut connected_edges_next_dev,
+	);
+    }
+
     // Get the results
     let grayscale_host = grayscale_dev.to_host_vec(&grayscale_stream).unwrap();
     let edges_host = edges_dev.to_host_vec(&edge_stream).unwrap();
     let thin_edges_host = thin_edges_dev.to_host_vec(&nms_stream).unwrap();
     let edge_classes_host = edge_classes_dev.to_host_vec(&threshold_stream).unwrap();
+    let connected_edges_host = connected_edges_dev.to_host_vec(&hysteresis_stream).unwrap();
 
     println!("Thin-edge max: {}", thin_edges_host.iter().copied().fold(0.0_f32, f32::max));
 
@@ -274,6 +362,7 @@ fn main() {
     let edges: Vec<u8> = normalized_f32_to_u8(&edges_host, 1.0);
     let thin_edges: Vec<u8> = normalized_f32_to_u8(&thin_edges_host, 12.0);
     let edge_classes: Vec<u8> = normalized_f32_to_u8(&edge_classes_host, 1.0);
+    let connected_edges: Vec<u8> = normalized_f32_to_u8(&connected_edges_host, 1.0);
 
     let grayscale_img = image::GrayImage::from_raw(rgba.width(), rgba.height(), grayscale)
         .expect("grayscale buffer has the wrong length");
@@ -283,11 +372,14 @@ fn main() {
         .expect("thin_edges buffer has the wrong length");
     let edge_classes_img = image::GrayImage::from_raw(rgba.width(), rgba.height(), edge_classes)
         .expect("edge_classes buffer has the wrong length");
+    let connected_edges_img = image::GrayImage::from_raw(rgba.width(), rgba.height(), connected_edges)
+        .expect("connected_edges buffer has the wrong length");
 
     grayscale_img.save("assets/circle-grayscale.png").unwrap();
     edges_img.save("assets/circle-edges.png").unwrap();
     thin_edges_img.save("assets/circle-thin-edges.png").unwrap();
     edge_classes_img.save("assets/circle-edge-classes.png").unwrap();
+    connected_edges_img.save("assets/circle-connected-edges.png").unwrap();
     
     println!("Hello, world!");
 }
