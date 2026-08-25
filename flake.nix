@@ -277,6 +277,9 @@
           # -lzstd, -lz). Putting them in buildInputs lets cc-wrapper add the
           # right -L paths via NIX_LDFLAGS.
           buildInputs = with pkgs; [
+            # Required by nannou's Linux font backend.
+            fontconfig.dev
+            freetype.dev
             libffi
             libxml2
             zstd
@@ -286,6 +289,7 @@
           shellHook = ''
             export CUDA_HOME="${cudaSymlinked}"
             export LIBCLANG_PATH="${llvmPkgs.libclang.lib}/lib"
+            export PKG_CONFIG_PATH="${pkgs.fontconfig.dev}/lib/pkgconfig:${pkgs.freetype.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
             # GPU driver setup borrowed from https://github.com/NVlabs/cutile-rs
             # NixOS provides /run/opengl-driver/lib
