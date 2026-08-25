@@ -1,5 +1,6 @@
 mod edge_detection;
 mod kernels;
+mod path_generation;
 
 use nannou::prelude::*;
 use nannou::prelude::bevy_asset::RenderAssetUsages;
@@ -12,6 +13,8 @@ type AppModel = Result<Model, String>;
 
 struct Model {
     panels: [ImagePanel; 5],
+    laser_path: path_generation::LaserPath,
+    laser_path_label: String,
 }
 
 struct ImagePanel {
@@ -34,6 +37,13 @@ fn model(app: &App) -> AppModel {
         eprintln!("Edge detection failed: {error}");
         error
     })?;
+    let laser_path = path_generation::from_hysteresis(&images.connected_edges);
+    let laser_path_label = format!(
+        "Laser path - {} lines / {} isolated points / {} DAC points",
+        laser_path.laser_lines().len(),
+        laser_path.laser_points().len(),
+        laser_path.point_count()
+    );
 
     let upload = |image| {
         let image = Image::from_dynamic(
@@ -67,6 +77,8 @@ fn model(app: &App) -> AppModel {
                 image: upload(images.connected_edges),
             },
         ],
+        laser_path,
+        laser_path_label,
     })
 }
 
@@ -99,10 +111,11 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
         .min(cell_height - label_height - 12.0)
         .max(1.0);
 
-    for (index, panel) in model.panels.iter().enumerate() {
+    let panel_count = model.panels.len() + 1;
+    for index in 0..panel_count {
         let row = index / COLUMNS;
         let column = index % COLUMNS;
-        let items_in_row = (model.panels.len() - row * COLUMNS).min(COLUMNS);
+        let items_in_row = (panel_count - row * COLUMNS).min(COLUMNS);
         let row_width = items_in_row as f32 * cell_width
             + items_in_row.saturating_sub(1) as f32 * gap;
         let x = -row_width * 0.5 + cell_width * 0.5 + column as f32 * (cell_width + gap);
@@ -114,14 +127,39 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
             .x_y(x, cell_y)
             .w_h(cell_width, cell_height)
             .color(Color::srgb_u8(24, 28, 31));
-        draw.text(panel.label)
+        let label = model
+            .panels
+            .get(index)
+            .map_or(model.laser_path_label.as_str(), |panel| panel.label);
+        draw.text(label)
             .x_y(x, cell_top - label_height * 0.5)
             .font_size(16)
             .color(Color::srgb_u8(210, 216, 220));
-        draw.rect()
-            .x_y(x, image_y)
-            .w_h(image_size, image_size)
-            .color(WHITE)
-            .texture(&panel.image);
+
+        if let Some(panel) = model.panels.get(index) {
+            draw.rect()
+                .x_y(x, image_y)
+                .w_h(image_size, image_size)
+                .color(WHITE)
+                .texture(&panel.image);
+        } else {
+            let scale = image_size * 0.5;
+            draw.x_y(x, image_y)
+                .scale(scale)
+                .path()
+                .stroke()
+                .weight(2.0 / scale)
+                .color(Color::srgb_u8(51, 255, 166))
+                .events(model.laser_path.lyon_path().iter());
+            for point in model.laser_path.laser_points() {
+                draw.ellipse()
+                    .x_y(
+                        x + point.position[0] * scale,
+                        image_y + point.position[1] * scale,
+                    )
+                    .w_h(5.0, 5.0)
+                    .color(Color::srgb_u8(51, 255, 166));
+            }
+        }
     }
 }
