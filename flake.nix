@@ -259,11 +259,16 @@
         devShells.default = pkgs.mkShell {
           packages = [
             rustToolchain
+            pkgs.stdenv.cc
 
             llvmPkgs.clang
             llvmPkgs.libclang
 
             cudaSymlinked
+            # Nsight Compute 2026 requires a CUDA 13-compatible driver, while
+            # the WSL host currently provides R576. Pin the CUDA 12.9 release.
+            pkgs.cudaPackages_12_9.nsight_compute
+            pkgs.cudaPackages_13.nsight_systems
 
             cargo-oxide
           ];
@@ -273,6 +278,17 @@
           # -lzstd, -lz). Putting them in buildInputs lets cc-wrapper add the
           # right -L paths via NIX_LDFLAGS.
           buildInputs = with pkgs; [
+            # Required by nannou's Linux font backend.
+            fontconfig.dev
+            freetype.dev
+            wayland
+            libxkbcommon
+            libglvnd
+            mesa
+            libx11
+            libxcursor
+            libxi
+            libxrandr
             libffi
             libxml2
             zstd
@@ -282,6 +298,10 @@
           shellHook = ''
             export CUDA_HOME="${cudaSymlinked}"
             export LIBCLANG_PATH="${llvmPkgs.libclang.lib}/lib"
+            export CC="${pkgs.stdenv.cc}/bin/cc"
+            export CXX="${pkgs.stdenv.cc}/bin/c++"
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$CC"
+            export PKG_CONFIG_PATH="${pkgs.fontconfig.dev}/lib/pkgconfig:${pkgs.freetype.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
             # GPU driver setup borrowed from https://github.com/NVlabs/cutile-rs
             # NixOS provides /run/opengl-driver/lib
@@ -291,7 +311,15 @@
             # path: loading libcuda through a relocated symlink breaks WSL's
             # driver initialization with CUDA_ERROR_OPERATING_SYSTEM.
             elif [ -e /usr/lib/wsl/lib/libcuda.so.1 ]; then
-              export LD_LIBRARY_PATH="/usr/lib/wsl/lib:$LD_LIBRARY_PATH"
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.wayland pkgs.libxkbcommon pkgs.libglvnd pkgs.libglvnd.dev pkgs.mesa pkgs.libx11 pkgs.libxcursor pkgs.libxi pkgs.libxrandr ]}:/usr/lib/wsl/lib:$LD_LIBRARY_PATH"
+              export __EGL_VENDOR_LIBRARY_DIRS="${pkgs.mesa}/share/glvnd/egl_vendor.d"
+              # Use WSLg's D3D12-backed GL renderer.
+              export WGPU_BACKEND=gl
+              export WGPU_EGL_FORCE_X11=1
+              export GALLIUM_DRIVER=d3d12
+              export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+              export WGPU_EGL_ALLOW_NON_NATIVE_PRESENTATION=1
+              unset WAYLAND_DISPLAY WAYLAND_SOCKET
             else
               # Non-NixOS Linux (Ubuntu, Arch, etc. running Nix)
               # Symlink only the NVIDIA driver to avoid host glibc pollution
