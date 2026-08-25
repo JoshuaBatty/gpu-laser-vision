@@ -12,22 +12,6 @@ pub struct EdgeDetectionImages {
     pub connected_edges: GrayImage,
 }
 
-impl EdgeDetectionImages {
-    pub fn save(&self, output_dir: impl AsRef<Path>) -> Result<()> {
-        let output_dir = output_dir.as_ref();
-        self.grayscale
-            .save(output_dir.join("circle-grayscale.png"))?;
-        self.edges.save(output_dir.join("circle-edges.png"))?;
-        self.thin_edges
-            .save(output_dir.join("circle-thin-edges.png"))?;
-        self.edge_classes
-            .save(output_dir.join("circle-edge-classes.png"))?;
-        self.connected_edges
-            .save(output_dir.join("circle-connected-edges.png"))?;
-        Ok(())
-    }
-}
-
 pub fn process(path: impl AsRef<Path>) -> Result<EdgeDetectionImages> {
     // Initialize CUDA
     let ctx = CudaContext::new(0)?;
