@@ -1,5 +1,6 @@
 mod edge_detection;
 mod kernels;
+mod laser;
 mod path_generation;
 
 use nannou::prelude::*;
@@ -14,7 +15,7 @@ type AppModel = Result<Model, String>;
 struct Model {
     panels: [ImagePanel; 5],
     laser_path: path_generation::LaserPath,
-    laser_path_label: String,
+    laser: laser::EtherDreamStream,
 }
 
 struct ImagePanel {
@@ -38,12 +39,7 @@ fn model(app: &App) -> AppModel {
         error
     })?;
     let laser_path = path_generation::from_hysteresis(&images.connected_edges);
-    let laser_path_label = format!(
-        "Laser path - {} lines / {} isolated points / {} DAC points",
-        laser_path.laser_lines().len(),
-        laser_path.laser_points().len(),
-        laser_path.point_count()
-    );
+    let laser = laser::EtherDreamStream::start(&laser_path);
 
     let upload = |image| {
         let image = Image::from_dynamic(
@@ -78,7 +74,7 @@ fn model(app: &App) -> AppModel {
             },
         ],
         laser_path,
-        laser_path_label,
+        laser,
     })
 }
 
@@ -110,6 +106,12 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
     let image_size = cell_width
         .min(cell_height - label_height - 12.0)
         .max(1.0);
+    let laser_path_label = format!(
+        "Laser - {} lines / {} points - {}",
+        model.laser_path.laser_lines().len(),
+        model.laser_path.point_count(),
+        model.laser.status()
+    );
 
     let panel_count = model.panels.len() + 1;
     for index in 0..panel_count {
@@ -130,7 +132,7 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
         let label = model
             .panels
             .get(index)
-            .map_or(model.laser_path_label.as_str(), |panel| panel.label);
+            .map_or(laser_path_label.as_str(), |panel| panel.label);
         draw.text(label)
             .x_y(x, cell_top - label_height * 0.5)
             .font_size(16)
