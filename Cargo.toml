@@ -11,3 +11,4 @@ cuda-async = { path = "../../crates/cuda-oxide/crates/cuda-async" }
 cuda-core = { path = "../../crates/cuda-oxide/crates/cuda-core" }
 cuda-device = { path = "../../crates/cuda-oxide/crates/cuda-device" }
 cuda-host = { path = "../../crates/cuda-oxide/crates/cuda-host" }
+nannou_laser = "0.20.0"
