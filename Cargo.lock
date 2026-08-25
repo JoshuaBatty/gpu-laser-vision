@@ -645,7 +645,7 @@ dependencies = [
  "bevy_utils",
  "bevy_window",
  "bitflags 2.13.1",
- "indexmap",
+ "indexmap 2.14.0",
  "nonmax",
 ]
 
@@ -726,8 +726,8 @@ dependencies = [
  "bumpalo",
  "concurrent-queue",
  "derive_more",
- "fixedbitset",
- "indexmap",
+ "fixedbitset 0.5.7",
+ "indexmap 2.14.0",
  "log",
  "nonmax",
  "serde",
@@ -1151,8 +1151,8 @@ dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
  "derive_more",
- "fixedbitset",
- "indexmap",
+ "fixedbitset 0.5.7",
+ "indexmap 2.14.0",
  "nonmax",
  "offset-allocator",
  "smallvec",
@@ -1254,7 +1254,7 @@ dependencies = [
  "erased-serde",
  "foldhash 0.2.0",
  "glam",
- "indexmap",
+ "indexmap 2.14.0",
  "inventory",
  "serde",
  "smallvec",
@@ -1272,7 +1272,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fc5f820ee52afeca6d3bb83f15c1bf61ea6196c840a761a21a8bc266a3b166e"
 dependencies = [
  "bevy_macro_utils",
- "indexmap",
+ "indexmap 2.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -1316,7 +1316,7 @@ dependencies = [
  "encase",
  "glam",
  "image",
- "indexmap",
+ "indexmap 2.14.0",
  "itertools 0.14.0",
  "js-sys",
  "naga",
@@ -1451,7 +1451,7 @@ dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
  "derive_more",
- "fixedbitset",
+ "fixedbitset 0.5.7",
  "nonmax",
  "tracing",
 ]
@@ -1630,7 +1630,7 @@ dependencies = [
  "bevy_utils",
  "bytemuck",
  "derive_more",
- "indexmap",
+ "indexmap 2.14.0",
  "tracing",
 ]
 
@@ -1667,7 +1667,7 @@ dependencies = [
  "async-channel",
  "bevy_platform",
  "disqualified",
- "indexmap",
+ "indexmap 2.14.0",
  "thread_local",
 ]
 
@@ -2507,6 +2507,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b5343afd4a8365a643ac588dab4cf234a190c7f6c88c9f6dd6ffe00837661b7"
 
 [[package]]
+name = "ether-dream"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58a127dc88cfd72b4119787229f18c70a73b14c27da8f77de7ad5e9568315772"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+]
+
+[[package]]
 name = "euclid"
 version = "0.22.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2584,6 +2594,12 @@ name = "find_folder"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f6d018fb95a0b59f854aed68ecd96ce2b80af7911b92b1fed3c4b1fa516b91b"
+
+[[package]]
+name = "fixedbitset"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37ab347416e802de484e4d03c7316c48f1ecb56574dfd4a46a80f173ce1de04d"
 
 [[package]]
 name = "fixedbitset"
@@ -2979,6 +2995,12 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
+
+[[package]]
+name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
@@ -3212,6 +3234,16 @@ checksum = "89194689a993ab15268672e99e7b0e19da2da3268ac682e8f02d29d4d1434cd7"
 
 [[package]]
 name = "indexmap"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd070e393353796e801d209ad339e89596eb4c8d430d18ede6a1cced8fafbd99"
+dependencies = [
+ "autocfg",
+ "hashbrown 0.12.3",
+]
+
+[[package]]
+name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
@@ -3361,6 +3393,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d50be8a24c37debdf3170be6ca396d5b5b165f37f94837891adac735ca416b8"
 dependencies = [
  "bitflags 2.13.1",
+]
+
+[[package]]
+name = "lasy"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdd71d1e5310a55e09ba97cb2f86abf9fd7cfd54e8017b972943de1ddac6af52"
+dependencies = [
+ "petgraph 0.5.1",
 ]
 
 [[package]]
@@ -3619,7 +3660,7 @@ dependencies = [
  "half",
  "hashbrown 0.16.1",
  "hexf-parse",
- "indexmap",
+ "indexmap 2.14.0",
  "libm",
  "log",
  "num-traits",
@@ -3639,7 +3680,7 @@ checksum = "319f03062940ed85c03da020042618356bb8ca5263020322930883b05e30208e"
 dependencies = [
  "codespan-reporting 0.12.0",
  "data-encoding",
- "indexmap",
+ "indexmap 2.14.0",
  "naga",
  "regex",
  "rustc-hash 1.1.0",
@@ -3680,6 +3721,7 @@ dependencies = [
  "cuda-host",
  "image",
  "nannou",
+ "nannou_laser",
 ]
 
 [[package]]
@@ -3719,6 +3761,17 @@ dependencies = [
  "skrifa 0.42.1",
  "swash",
  "uuid",
+]
+
+[[package]]
+name = "nannou_laser"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e5d3bd11b05d936b8f80f1aed158ce0f5b53ef92c3f7f19ea9fa1c5ce7f8fca"
+dependencies = [
+ "ether-dream",
+ "lasy",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4251,7 +4304,7 @@ checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
  "crc32fast",
  "hashbrown 0.15.5",
- "indexmap",
+ "indexmap 2.14.0",
  "memchr",
 ]
 
@@ -4407,13 +4460,23 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "petgraph"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "467d164a6de56270bd7c4d070df81d07beace25012d5103ced4e9ff08d6afdb7"
+dependencies = [
+ "fixedbitset 0.2.0",
+ "indexmap 1.9.3",
+]
+
+[[package]]
+name = "petgraph"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
 dependencies = [
- "fixedbitset",
+ "fixedbitset 0.5.7",
  "hashbrown 0.15.5",
- "indexmap",
+ "indexmap 2.14.0",
 ]
 
 [[package]]
@@ -5558,7 +5621,7 @@ version = "0.25.13+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
 dependencies = [
- "indexmap",
+ "indexmap 2.14.0",
  "toml_datetime",
  "toml_parser",
  "winnow",
@@ -5665,7 +5728,7 @@ checksum = "b8765b90061cba6c22b5831f675da109ae5561588290f9fa2317adab2714d5a6"
 dependencies = [
  "memchr",
  "nom 8.0.0",
- "petgraph",
+ "petgraph 0.8.3",
 ]
 
 [[package]]
@@ -6051,7 +6114,7 @@ dependencies = [
  "cfg_aliases",
  "document-features",
  "hashbrown 0.16.1",
- "indexmap",
+ "indexmap 2.14.0",
  "log",
  "naga",
  "once_cell",

@@ -187,4 +187,96 @@ mod device {
             };
         }
     }
+
+    // Recover original image colours on the GPU before the live pipeline leaves image space.
+    #[kernel]
+    pub fn colorize_edges(
+        rgba: &[u8],
+        connected_edges: &[f32],
+        grad_x: &[f32],
+        grad_y: &[f32],
+        mut edge_colors: DisjointSlice<u32>,
+        w: usize,
+        h: usize,
+        sample_distance: usize,
+    ) {
+        if let Some((edge_color, idx)) = edge_colors.get_mut_indexed() {
+            let i = idx.get();
+            if connected_edges[i] == 0.0 {
+                *edge_color = 0;
+                return;
+            }
+
+            let x = i % w;
+            let y = i / w;
+            let gx = grad_x[i];
+            let gy = grad_y[i];
+
+            // Quantize the gradient normal to horizontal, vertical, or diagonal.
+            let (dx, dy): (isize, isize) = if gx.abs() >= gy.abs() {
+                if gy.abs() * 2.0 <= gx.abs() {
+                    (1, 0)
+                } else if gx * gy >= 0.0 {
+                    (1, 1)
+                } else {
+                    (1, -1)
+                }
+            } else if gx.abs() * 2.0 <= gy.abs() {
+                (0, 1)
+            } else if gx * gy >= 0.0 {
+                (1, 1)
+            } else {
+                (1, -1)
+            };
+
+            let plus_x = offset_coordinate(x, dx, sample_distance, w);
+            let plus_y = offset_coordinate(y, dy, sample_distance, h);
+            let minus_x = offset_coordinate(x, -dx, sample_distance, w);
+            let minus_y = offset_coordinate(y, -dy, sample_distance, h);
+
+            let center = i;
+            let plus = plus_y * w + plus_x;
+            let minus = minus_y * w + minus_x;
+            let mut selected = center;
+            let mut selected_score = color_score(rgba, center);
+            let plus_score = color_score(rgba, plus);
+            if plus_score > selected_score {
+                selected = plus;
+                selected_score = plus_score;
+            }
+            if color_score(rgba, minus) > selected_score {
+                selected = minus;
+            }
+
+            let source = selected * 4;
+            *edge_color = rgba[source] as u32
+                | (rgba[source + 1] as u32) << 8
+                | (rgba[source + 2] as u32) << 16;
+        }
+    }
+
+    fn offset_coordinate(
+        coordinate: usize,
+        direction: isize,
+        distance: usize,
+        limit: usize,
+    ) -> usize {
+        if direction < 0 {
+            coordinate.saturating_sub(distance)
+        } else if direction > 0 {
+            (coordinate + distance).min(limit - 1)
+        } else {
+            coordinate
+        }
+    }
+
+    fn color_score(rgba: &[u8], pixel: usize) -> u16 {
+        let source = pixel * 4;
+        let red = rgba[source];
+        let green = rgba[source + 1];
+        let blue = rgba[source + 2];
+        let brightest = red.max(green).max(blue);
+        let darkest = red.min(green).min(blue);
+        brightest as u16 * 2 + (brightest - darkest) as u16
+    }
 }
