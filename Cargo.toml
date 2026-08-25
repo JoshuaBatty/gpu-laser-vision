@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
 image = "0.25"
 cuda-async = { path = "../../crates/cuda-oxide/crates/cuda-async" }
 cuda-core = { path = "../../crates/cuda-oxide/crates/cuda-core" }
