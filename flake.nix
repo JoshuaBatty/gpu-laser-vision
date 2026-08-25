@@ -264,6 +264,10 @@
             llvmPkgs.libclang
 
             cudaSymlinked
+            # Nsight Compute 2026 requires a CUDA 13-compatible driver, while
+            # the WSL host currently provides R576. Pin the CUDA 12.9 release.
+            pkgs.cudaPackages_12_9.nsight_compute
+            pkgs.cudaPackages_13.nsight_systems
 
             cargo-oxide
           ];

@@ -19,7 +19,7 @@ mod device {
     }
 
     #[kernel]
-    pub fn edge_detect(
+    pub fn scharr(
         gray: &[f32],
         mut b: DisjointSlice<f32>,
         mut grad_x: DisjointSlice<f32>,
@@ -54,7 +54,6 @@ mod device {
             let bottom = gray[i + w];
             let bottom_right = gray[i + w + 1];
 
-            // Sobel horizontal and vertical gradients.
             // Scharr horizontal and vertical gradients.
             let gx = (-3.0 * top_left + 3.0 * top_right - 10.0 * left + 10.0 * right
                 - 3.0 * bottom_left

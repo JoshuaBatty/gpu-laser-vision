@@ -56,9 +56,9 @@ fn main() -> Result<()> {
     // Do not run edge detection until grayscale is complete.
     edge_stream.wait(&grayscale_done)?;
 
-    // Launch the edge detection kernel.
+    // Launch the Scharr edge detection kernel.
     unsafe {
-        module.edge_detect(
+        module.scharr(
             &edge_stream,
             LaunchConfig::for_num_elems(n as u32),
             &grayscale_dev,
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
             h,
         )
     }
-    .context("launching edge-detection kernel")?;
+    .context("launching Scharr kernel")?;
 
     // Record when the edge kernal has completed its work.
     let edge_done = edge_stream.record_event(None)?;
