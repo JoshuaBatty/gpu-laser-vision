@@ -1,16 +1,18 @@
 //! GPU-accelerated edge-detection pipeline.
 //!
 //! This module owns the CUDA setup and kernel execution, then reconstructs
-//! each processing stage as a host-side grayscale image.
+//! each processing stage as a host-side image.
 
 use crate::kernels;
 use anyhow::{Context, Result};
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
-use image::{GrayImage, ImageReader};
+use image::{GrayImage, ImageReader, RgbImage, RgbaImage};
 use std::path::Path;
 
 /// Images produced by each stage of the GPU edge-detection pipeline.
 pub struct EdgeDetectionImages {
+    /// Original colour image supplied to the GPU pipeline.
+    pub original: RgbaImage,
     /// Grayscale image used as input to the edge detector.
     pub grayscale: GrayImage,
     /// Gradient magnitude produced by the Scharr operator.
@@ -21,6 +23,8 @@ pub struct EdgeDetectionImages {
     pub edge_classes: GrayImage,
     /// Final edges retained after hysteresis connectivity tracking.
     pub connected_edges: GrayImage,
+    /// Original source colours sampled around each final edge on the GPU.
+    pub edge_colors: RgbImage,
 }
 
 /// Runs the GPU edge-detection pipeline on the image at `path`.
@@ -59,6 +63,7 @@ pub fn process(path: impl AsRef<Path>) -> Result<EdgeDetectionImages> {
     let mut connected_edges_next_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, n)?;
     let mut grad_x_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, n)?;
     let mut grad_y_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, n)?;
+    let mut edge_colors_dev = DeviceBuffer::<u32>::zeroed(&hysteresis_stream, n)?;
 
     // Load embedded PTX module, exposes generated kernel launchers.
     let module = kernels::load(&ctx).context("loading embedded CUDA module")?;
@@ -162,12 +167,29 @@ pub fn process(path: impl AsRef<Path>) -> Result<EdgeDetectionImages> {
         std::mem::swap(&mut connected_edges_dev, &mut connected_edges_next_dev);
     }
 
+    unsafe {
+        module.colorize_edges(
+            &hysteresis_stream,
+            LaunchConfig::for_num_elems(n as u32),
+            &rgba_dev,
+            &connected_edges_dev,
+            &grad_x_dev,
+            &grad_y_dev,
+            &mut edge_colors_dev,
+            w,
+            h,
+            2,
+        )
+    }
+    .context("launching edge-colour recovery kernel")?;
+
     // Get the results
     let grayscale_host = grayscale_dev.to_host_vec(&grayscale_stream)?;
     let edges_host = edges_dev.to_host_vec(&edge_stream)?;
     let thin_edges_host = thin_edges_dev.to_host_vec(&nms_stream)?;
     let edge_classes_host = edge_classes_dev.to_host_vec(&threshold_stream)?;
     let connected_edges_host = connected_edges_dev.to_host_vec(&hysteresis_stream)?;
+    let edge_colors_host = edge_colors_dev.to_host_vec(&hysteresis_stream)?;
 
     println!(
         "Thin-edge max: {}",
@@ -180,6 +202,16 @@ pub fn process(path: impl AsRef<Path>) -> Result<EdgeDetectionImages> {
     let thin_edges: Vec<u8> = normalized_f32_to_u8(&thin_edges_host, 12.0);
     let edge_classes: Vec<u8> = normalized_f32_to_u8(&edge_classes_host, 1.0);
     let connected_edges: Vec<u8> = normalized_f32_to_u8(&connected_edges_host, 1.0);
+    let edge_colors: Vec<u8> = edge_colors_host
+        .into_iter()
+        .flat_map(|color| {
+            [
+                (color & 0xff) as u8,
+                ((color >> 8) & 0xff) as u8,
+                ((color >> 16) & 0xff) as u8,
+            ]
+        })
+        .collect();
 
     let image = |data| {
         GrayImage::from_raw(rgba.width(), rgba.height(), data)
@@ -192,6 +224,9 @@ pub fn process(path: impl AsRef<Path>) -> Result<EdgeDetectionImages> {
         thin_edges: image(thin_edges)?,
         edge_classes: image(edge_classes)?,
         connected_edges: image(connected_edges)?,
+        edge_colors: RgbImage::from_raw(rgba.width(), rgba.height(), edge_colors)
+            .ok_or_else(|| anyhow::anyhow!("edge-colour buffer size does not match image dimensions"))?,
+        original: rgba,
     })
 }
 

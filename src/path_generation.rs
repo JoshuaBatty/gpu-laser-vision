@@ -2,11 +2,10 @@
 
 use std::collections::HashSet;
 
-use image::GrayImage;
+use image::{GrayImage, RgbImage};
 use nannou::lyon::{math::point, path::Path};
 use nannou_laser::Point as LaserPoint;
 
-const LASER_COLOR: [f32; 3] = [0.2, 1.0, 0.65];
 const NEIGHBOR_OFFSETS: [(isize, isize); 8] = [
     (1, 0),
     (1, 1),
@@ -53,7 +52,7 @@ struct PixelLine {
 }
 
 /// Traces the non-zero pixels in a hysteresis image into ordered vector paths.
-pub fn from_hysteresis(image: &GrayImage) -> LaserPath {
+pub fn from_hysteresis(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
     let width = image.width() as usize;
     let height = image.height() as usize;
     let active: Vec<_> = image.as_raw().iter().map(|&value| value != 0).collect();
@@ -115,27 +114,36 @@ pub fn from_hysteresis(image: &GrayImage) -> LaserPath {
     let mut lyon_builder = Path::builder();
     let laser_points = isolated_pixels
         .into_iter()
-        .map(|pixel| LaserPoint::new(normalize(pixel, width, height), LASER_COLOR))
+        .map(|pixel| {
+            LaserPoint::new(
+                normalize(pixel, width, height),
+                laser_color(pixel, edge_colors),
+            )
+        })
         .collect();
     let mut laser_lines = Vec::with_capacity(lines.len());
 
     for line in lines {
-        let positions: Vec<_> = line
+        let mut laser_line: Vec<_> = line
             .pixels
             .into_iter()
-            .map(|pixel| normalize(pixel, width, height))
+            .map(|pixel| {
+                LaserPoint::new(
+                    normalize(pixel, width, height),
+                    laser_color(pixel, edge_colors),
+                )
+            })
             .collect();
 
-        lyon_builder.begin(point(positions[0][0], positions[0][1]));
-        for position in &positions[1..] {
-            lyon_builder.line_to(point(position[0], position[1]));
+        lyon_builder.begin(point(
+            laser_line[0].position[0],
+            laser_line[0].position[1],
+        ));
+        for laser_point in &laser_line[1..] {
+            lyon_builder.line_to(point(laser_point.position[0], laser_point.position[1]));
         }
         lyon_builder.end(line.closed);
 
-        let mut laser_line: Vec<_> = positions
-            .into_iter()
-            .map(|position| LaserPoint::new(position, LASER_COLOR))
-            .collect();
         if line.closed {
             laser_line.push(laser_line[0]);
         }
@@ -256,6 +264,16 @@ fn normalize(pixel: usize, width: usize, height: usize) -> [f32; 2] {
     let x = (pixel % width) as f32 / width.saturating_sub(1).max(1) as f32;
     let y = (pixel / width) as f32 / height.saturating_sub(1).max(1) as f32;
     [x * 2.0 - 1.0, 1.0 - y * 2.0]
+}
+
+fn laser_color(pixel: usize, edge_colors: &RgbImage) -> [f32; 3] {
+    let source = pixel * 3;
+    let colors = edge_colors.as_raw();
+    [
+        colors[source] as f32 / 255.0,
+        colors[source + 1] as f32 / 255.0,
+        colors[source + 2] as f32 / 255.0,
+    ]
 }
 
 fn edge(a: usize, b: usize) -> (usize, usize) {
