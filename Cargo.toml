@@ -1,0 +1,11 @@
+[package]
+name = "nannou-laser-cuda"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+image = "0.25"
+cuda-async = { path = "../../crates/cuda-oxide/crates/cuda-async" }
+cuda-core = { path = "../../crates/cuda-oxide/crates/cuda-core" }
+cuda-device = { path = "../../crates/cuda-oxide/crates/cuda-device" }
+cuda-host = { path = "../../crates/cuda-oxide/crates/cuda-host" }
