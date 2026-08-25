@@ -2,6 +2,11 @@ use crate::kernels;
 use anyhow::{Context, Result};
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use image::{GrayImage, ImageReader};
+//! GPU-accelerated edge-detection pipeline.
+//!
+//! This module owns the CUDA setup and kernel execution, then reconstructs
+//! each processing stage as a host-side grayscale image.
+
 use std::path::Path;
 
 /// Images produced by each stage of the GPU edge-detection pipeline.
