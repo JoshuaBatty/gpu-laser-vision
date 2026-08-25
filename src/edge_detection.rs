@@ -4,14 +4,24 @@ use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use image::{GrayImage, ImageReader};
 use std::path::Path;
 
+/// Images produced by each stage of the GPU edge-detection pipeline.
 pub struct EdgeDetectionImages {
+    /// Grayscale image used as input to the edge detector.
     pub grayscale: GrayImage,
+    /// Gradient magnitude produced by the Scharr operator.
     pub edges: GrayImage,
+    /// Edges thinned by non-maximum suppression.
     pub thin_edges: GrayImage,
+    /// Weak and strong edge classes produced by double thresholding.
     pub edge_classes: GrayImage,
+    /// Final edges retained after hysteresis connectivity tracking.
     pub connected_edges: GrayImage,
 }
 
+/// Runs the GPU edge-detection pipeline on the image at `path`.
+///
+/// Returns the output of every stage, or an error from image loading, CUDA
+/// setup and execution, or reconstruction of the output images.
 pub fn process(path: impl AsRef<Path>) -> Result<EdgeDetectionImages> {
     // Initialize CUDA
     let ctx = CudaContext::new(0)?;
