@@ -188,6 +188,14 @@ mod device {
         }
     }
 
+    /// Converts a normalized floating-point stage into display-ready bytes on the GPU.
+    #[kernel]
+    pub fn normalized_f32_to_u8(input: &[f32], mut output: DisjointSlice<u8>, gain: f32) {
+        if let Some((output, idx)) = output.get_mut_indexed() {
+            *output = ((input[idx.get()] * gain).clamp(0.0, 1.0) * 255.0) as u8;
+        }
+    }
+
     // Recover original image colours on the GPU before the live pipeline leaves image space.
     #[kernel]
     pub fn colorize_edges(

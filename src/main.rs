@@ -1,3 +1,4 @@
+mod cuda_graph;
 mod edge_detection;
 mod kernels;
 mod laser;
@@ -7,15 +8,19 @@ use bevy::app::{App as BevyApp, Plugin, PostUpdate};
 use bevy::window::{PrimaryWindow, Window};
 use nannou::prelude::bevy_asset::{Assets, RenderAssetUsages};
 use nannou::prelude::*;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::{
+    sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
+};
 
 const SOURCE_IMAGE: &str = "assets/test_tiles.png";
 const COLUMNS: usize = 3;
+const DEBUG_UPLOAD_INTERVAL: u64 = 3;
 
 type AppModel = Result<Model, String>;
 
 struct Model {
-    panels: [ImagePanel; 7],
+    panels: [ImagePanel; 8],
     laser_path: path_generation::LaserPath,
     laser: laser::EtherDreamStream,
     video: Arc<Mutex<VideoBridgeState>>,
@@ -35,13 +40,20 @@ struct VideoBridgeState {
     image: Option<Handle<Image>>,
     processed: Option<ProcessedVideoFrame>,
     error: Option<String>,
-    middle_seconds: Option<f64>,
-    seek_requested: bool,
     window_sized: bool,
+    fps_window_started: Option<Instant>,
+    processed_frames: u64,
+    reported_first_frame: bool,
+    debug_upload_counter: u64,
+}
+
+#[derive(Default)]
+struct VideoCudaPipeline {
+    detector: Option<edge_detection::CudaEdgeDetector>,
 }
 
 struct ProcessedVideoFrame {
-    panels: [ImagePanel; 7],
+    panels: [ImagePanel; 8],
     laser_path: path_generation::LaserPath,
 }
 
@@ -49,7 +61,8 @@ struct VideoBridgePlugin;
 
 impl Plugin for VideoBridgePlugin {
     fn build(&self, app: &mut BevyApp) {
-        app.add_systems(PostUpdate, capture_middle_video_frame);
+        app.insert_non_send(VideoCudaPipeline::default())
+            .add_systems(PostUpdate, process_video_frames);
     }
 }
 
@@ -72,11 +85,10 @@ fn model(app: &App) -> AppModel {
         eprintln!("Edge detection failed: {error}");
         error
     })?;
-    let laser_path =
-        path_generation::from_hysteresis(&images.connected_edges, &images.edge_colors);
+    let laser_path = path_generation::from_edge_mask(&images.laser_edges, &images.edge_colors);
     let laser = laser::EtherDreamStream::start(&laser_path);
     let video = Arc::new(Mutex::new(VideoBridgeState::default()));
-    let video_asset = app.asset_server().load("big_buck_bunny_720p.mp4");
+    let video_asset = app.asset_server().load("jcvd_green_screen_720p.mp4");
     app.command_scope({
         let video = video.clone();
         move |mut commands| {
@@ -100,46 +112,24 @@ fn model(app: &App) -> AppModel {
     })
 }
 
-fn capture_middle_video_frame(
-    outputs: Query<(Entity, &VideoOutput, &VideoPlayer, &VideoBridge), Changed<VideoOutput>>,
-    videos: Res<Assets<Video>>,
+fn process_video_frames(
+    outputs: Query<(&VideoOutput, &VideoBridge), Changed<VideoOutput>>,
     mut assets: ResMut<Assets<Image>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
-    mut commands: Commands,
+    mut pipeline: NonSendMut<VideoCudaPipeline>,
 ) {
-    for (entity, output, player, bridge) in &outputs {
-        let should_process = {
+    for (output, bridge) in &outputs {
+        {
             let mut video = lock_video(&bridge.0);
             video.image = Some(output.image.clone());
-            if let Some(source) = videos.get(&player.video) {
-                if !video.window_sized {
-                    if let Ok(mut window) = windows.single_mut() {
-                        window
-                            .resolution
-                            .set(source.size.x as f32, source.size.y as f32);
-                        video.window_sized = true;
-                    }
-                }
-                if video.middle_seconds.is_none() {
-                    video.middle_seconds = source.duration_seconds.map(|duration| duration * 0.5);
+            if !video.window_sized {
+                if let Ok(mut window) = windows.single_mut() {
+                    window
+                        .resolution
+                        .set(output.size.x as f32, output.size.y as f32);
+                    video.window_sized = true;
                 }
             }
-            if !video.seek_requested {
-                if let Some(middle) = video.middle_seconds {
-                    commands.entity(entity).insert(SeekTo(middle));
-                    video.seek_requested = true;
-                }
-                false
-            } else {
-                video.processed.is_none()
-                    && video.error.is_none()
-                    && video
-                        .middle_seconds
-                        .is_some_and(|middle| output.position_seconds >= middle)
-            }
-        };
-        if !should_process {
-            continue;
         }
 
         let frame = {
@@ -156,28 +146,119 @@ fn capture_middle_video_frame(
             continue;
         };
 
-        match edge_detection::process_rgba(frame) {
+        let dimensions = (frame.width(), frame.height());
+        if pipeline
+            .detector
+            .as_ref()
+            .map(|detector| detector.dimensions())
+            != Some(dimensions)
+        {
+            match edge_detection::CudaEdgeDetector::new(dimensions.0, dimensions.1) {
+                Ok(detector) => pipeline.detector = Some(detector),
+                Err(error) => {
+                    lock_video(&bridge.0).error =
+                        Some(format!("CUDA graph setup failed: {error:#}"));
+                    continue;
+                }
+            }
+        }
+
+        let detector = pipeline
+            .detector
+            .as_mut()
+            .expect("detector was initialized");
+        let frame_started = Instant::now();
+        match detector.process(&frame) {
             Ok(images) => {
-                let laser_path = path_generation::from_hysteresis(
-                    &images.connected_edges,
-                    &images.edge_colors,
-                );
-                let panels = image_panels(images, |image| {
-                    assets.add(Image::from_dynamic(
-                        image,
-                        true,
-                        RenderAssetUsages::default(),
-                    ))
-                });
-                lock_video(&bridge.0).processed = Some(ProcessedVideoFrame {
-                    panels,
-                    laser_path,
-                });
-                commands.entity(entity).insert(SeekTo(0.0));
+                let laser_path =
+                    path_generation::from_edge_mask(&images.laser_edges, &images.edge_colors);
+                let mut video = lock_video(&bridge.0);
+                let point_count = laser_path.point_count();
+                let upload_debug = if video.processed.is_some() {
+                    video.debug_upload_counter += 1;
+                    let upload = video.debug_upload_counter >= DEBUG_UPLOAD_INTERVAL;
+                    if upload {
+                        video.debug_upload_counter = 0;
+                    }
+                    upload
+                } else {
+                    true
+                };
+                if let Some(processed) = &mut video.processed {
+                    update_processed_frame(
+                        processed,
+                        images,
+                        laser_path,
+                        upload_debug,
+                        &mut assets,
+                    );
+                } else {
+                    let panels = image_panels(images, |image| {
+                        assets.add(Image::from_dynamic(
+                            image,
+                            true,
+                            RenderAssetUsages::default(),
+                        ))
+                    });
+                    video.processed = Some(ProcessedVideoFrame { panels, laser_path });
+                }
+                video.error = None;
+                if !video.reported_first_frame {
+                    println!(
+                        "First frame: {:.1} ms | {point_count} laser points",
+                        frame_started.elapsed().as_secs_f64() * 1_000.0
+                    );
+                    video.reported_first_frame = true;
+                }
+                let now = Instant::now();
+                let started = *video.fps_window_started.get_or_insert(now);
+                video.processed_frames += 1;
+                let elapsed = now.duration_since(started).as_secs_f64();
+                if elapsed >= 2.0 {
+                    println!(
+                        "Pipeline: {:.1} FPS | {point_count} laser points",
+                        video.processed_frames as f64 / elapsed
+                    );
+                    video.fps_window_started = Some(now);
+                    video.processed_frames = 0;
+                }
             }
             Err(error) => {
-                lock_video(&bridge.0).error = Some(format!("First-frame CUDA failed: {error:#}"));
+                lock_video(&bridge.0).error = Some(format!("CUDA frame failed: {error:#}"));
             }
+        }
+    }
+}
+
+fn update_processed_frame(
+    processed: &mut ProcessedVideoFrame,
+    images: edge_detection::EdgeDetectionImages,
+    laser_path: path_generation::LaserPath,
+    upload_debug: bool,
+    assets: &mut Assets<Image>,
+) {
+    processed.laser_path = laser_path;
+    if !upload_debug {
+        return;
+    }
+
+    let images = [
+        image::DynamicImage::ImageRgba8(images.original),
+        image::DynamicImage::ImageLuma8(images.grayscale),
+        image::DynamicImage::ImageLuma8(images.edges),
+        image::DynamicImage::ImageLuma8(images.thin_edges),
+        image::DynamicImage::ImageLuma8(images.edge_classes),
+        image::DynamicImage::ImageLuma8(images.connected_edges),
+        image::DynamicImage::ImageLuma8(images.laser_edges),
+        image::DynamicImage::ImageRgb8(images.edge_colors),
+    ];
+
+    for (panel, image) in processed.panels.iter_mut().zip(images) {
+        let image = Image::from_dynamic(image, true, RenderAssetUsages::default());
+        if let Some(mut current) = assets.get_mut(&panel.image) {
+            current.data = image.data;
+        } else {
+            panel.image = assets.add(image);
         }
     }
 }
@@ -185,7 +266,7 @@ fn capture_middle_video_frame(
 fn image_panels(
     images: edge_detection::EdgeDetectionImages,
     mut upload: impl FnMut(image::DynamicImage) -> Handle<Image>,
-) -> [ImagePanel; 7] {
+) -> [ImagePanel; 8] {
     [
         ImagePanel {
             label: "Original",
@@ -212,6 +293,10 @@ fn image_panels(
             image: upload(image::DynamicImage::ImageLuma8(images.connected_edges)),
         },
         ImagePanel {
+            label: "Laser edge mask",
+            image: upload(image::DynamicImage::ImageLuma8(images.laser_edges)),
+        },
+        ImagePanel {
             label: "GPU edge colours",
             image: upload(image::DynamicImage::ImageRgb8(images.edge_colors)),
         },
@@ -219,7 +304,9 @@ fn image_panels(
 }
 
 fn lock_video(video: &Mutex<VideoBridgeState>) -> MutexGuard<'_, VideoBridgeState> {
-    video.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    video
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn view(app: &App, model: &AppModel, _window: Entity) {
@@ -252,28 +339,24 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
     let panel_count = panels.len() + 2;
     let row_count = panel_count.div_ceil(COLUMNS);
     let cell_width = ((window.w() - margin * 2.0 - gap * 2.0) / COLUMNS as f32).max(1.0);
-    let cell_height = ((window.h()
-        - margin * 2.0
-        - gap * row_count.saturating_sub(1) as f32)
+    let cell_height = ((window.h() - margin * 2.0 - gap * row_count.saturating_sub(1) as f32)
         / row_count as f32)
         .max(1.0);
-    let image_size = cell_width
-        .min(cell_height - label_height - 12.0)
-        .max(1.0);
+    let image_size = cell_width.min(cell_height - label_height - 12.0).max(1.0);
     let laser_path_label = format!(
         "Laser - {} lines / {} points - {}",
         laser_path.laser_lines().len(),
         laser_path.point_count(),
         model.laser.status()
     );
-    let video_label = video.error.as_deref().unwrap_or("Big Buck Bunny - 720p");
+    let video_label = video.error.as_deref().unwrap_or("JCVD green screen - 720p");
 
     for index in 0..panel_count {
         let row = index / COLUMNS;
         let column = index % COLUMNS;
         let items_in_row = (panel_count - row * COLUMNS).min(COLUMNS);
-        let row_width = items_in_row as f32 * cell_width
-            + items_in_row.saturating_sub(1) as f32 * gap;
+        let row_width =
+            items_in_row as f32 * cell_width + items_in_row.saturating_sub(1) as f32 * gap;
         let x = -row_width * 0.5 + cell_width * 0.5 + column as f32 * (cell_width + gap);
         let cell_top = window.top() - margin - row as f32 * (cell_height + gap);
         let cell_y = cell_top - cell_height * 0.5;
@@ -316,7 +399,7 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
                 .scale(scale)
                 .path()
                 .stroke()
-                .weight(2.0 / scale)
+                .weight(1.0)
                 .color(Color::srgb_u8(40, 52, 49))
                 .events(laser_path.lyon_path().iter());
             for line in laser_path.laser_lines() {
@@ -337,7 +420,7 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
                             x + end.position[0] * scale,
                             image_y + end.position[1] * scale,
                         ))
-                        .weight(2.0)
+                        .weight(1.0)
                         .color(Color::srgb(color[0], color[1], color[2]));
                 }
             }
@@ -347,12 +430,8 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
                         x + point.position[0] * scale,
                         image_y + point.position[1] * scale,
                     )
-                    .w_h(5.0, 5.0)
-                    .color(Color::srgb(
-                        point.color[0],
-                        point.color[1],
-                        point.color[2],
-                    ));
+                    .radius(1.0)
+                    .color(Color::srgb(point.color[0], point.color[1], point.color[2]));
             }
         }
     }
