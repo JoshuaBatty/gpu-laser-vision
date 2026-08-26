@@ -32,6 +32,17 @@ pub struct EdgeDetectionImages {
 /// Returns the output of every stage, or an error from image loading, CUDA
 /// setup and execution, or reconstruction of the output images.
 pub fn process(path: impl AsRef<Path>) -> Result<EdgeDetectionImages> {
+    let path = path.as_ref();
+    let rgba = ImageReader::open(path)
+        .with_context(|| format!("opening {}", path.display()))?
+        .decode()?
+        .into_rgba8();
+
+    process_rgba(rgba)
+}
+
+/// Runs the GPU edge-detection pipeline on an in-memory RGBA image.
+pub fn process_rgba(rgba: RgbaImage) -> Result<EdgeDetectionImages> {
     // Initialize CUDA
     let ctx = CudaContext::new(0)?;
 
@@ -42,16 +53,9 @@ pub fn process(path: impl AsRef<Path>) -> Result<EdgeDetectionImages> {
     let threshold_stream = ctx.new_stream()?;
     let hysteresis_stream = ctx.new_stream()?;
 
-    // Load an image
-    let path = path.as_ref();
-    let img = ImageReader::open(path)
-        .with_context(|| format!("opening {}", path.display()))?
-        .decode()?;
-
-    let w = img.width() as usize;
-    let h = img.height() as usize;
+    let w = rgba.width() as usize;
+    let h = rgba.height() as usize;
     let n = w * h;
-    let rgba = img.into_rgba8();
 
     // Allocate device memory
     let rgba_dev = DeviceBuffer::from_host(&grayscale_stream, rgba.as_raw())?;

@@ -5,8 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+bevy = { version = "0.19.0", default-features = false }
 image = "0.25"
-nannou = "0.20.0"
+nannou = { version = "0.20.0", features = ["video"] }
 cuda-async = { path = "../../crates/cuda-oxide/crates/cuda-async" }
 cuda-core = { path = "../../crates/cuda-oxide/crates/cuda-core" }
 cuda-device = { path = "../../crates/cuda-oxide/crates/cuda-device" }
