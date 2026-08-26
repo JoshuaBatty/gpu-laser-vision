@@ -271,6 +271,7 @@
             pkgs.cudaPackages_13.nsight_systems
 
             cargo-oxide
+            pkgs.ffmpeg
           ];
 
           # Transitive native deps of librustc_driver / LLVM that rust-lld
@@ -281,6 +282,7 @@
             # Required by nannou's Linux font backend.
             fontconfig.dev
             freetype.dev
+            ffmpeg.dev
             wayland
             libxkbcommon
             libglvnd
@@ -301,7 +303,7 @@
             export CC="${pkgs.stdenv.cc}/bin/cc"
             export CXX="${pkgs.stdenv.cc}/bin/c++"
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$CC"
-            export PKG_CONFIG_PATH="${pkgs.fontconfig.dev}/lib/pkgconfig:${pkgs.freetype.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+            export PKG_CONFIG_PATH="${pkgs.ffmpeg.dev}/lib/pkgconfig:${pkgs.fontconfig.dev}/lib/pkgconfig:${pkgs.freetype.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
             # GPU driver setup borrowed from https://github.com/NVlabs/cutile-rs
             # NixOS provides /run/opengl-driver/lib
