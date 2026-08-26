@@ -173,6 +173,8 @@
             # the headers explicitly (the default output is just LICENSE/src).
             libcublas.lib
             libcublas.include
+            libcurand.lib
+            libcurand.include
             computeSanitizer
           ];
         };
@@ -350,6 +352,8 @@
                 rm -rf "$_nv_drv_dir"
               fi
             fi
+
+            export CUDA_TOOLKIT_PATH="$CUDA_HOME"
 
             echo "🦀 cuda-oxide dev environment loaded"
             echo " ✓ CUDA $(nvcc  --version | grep 'release'      | awk '{print $6}' | cut -c 2-)"
