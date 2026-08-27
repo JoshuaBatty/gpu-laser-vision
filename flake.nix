@@ -85,6 +85,20 @@
             allowUnfree = true;
           };
         };
+        # tch 0.24.0 generates bindings for exactly PyTorch 2.11.0. Keep the
+        # Nix and Cargo sides of that ABI contract in lock-step: torch-sys
+        # compiles generated C++ against these headers and links these libs.
+        pytorchVersion = "2.11.0";
+        python = pkgs.python3.override {
+          packageOverrides = _final: previous: {
+            torch =
+              assert pkgs.lib.assertMsg (
+                previous.torch-bin.version == pytorchVersion
+              ) "tch 0.24.0 requires PyTorch ${pytorchVersion}; update both pins together";
+              previous.torch-bin;
+          };
+        };
+        pythonEnv = python.withPackages (pythonPackages: [ pythonPackages.torch ]);
 
         # LLVM
         llvmPkgs = pkgs.llvmPackages_22;
@@ -274,6 +288,8 @@
 
             cargo-oxide
             pkgs.ffmpeg
+            pythonEnv
+            pkgs.uv
           ];
 
           # Transitive native deps of librustc_driver / LLVM that rust-lld
@@ -300,6 +316,15 @@
           ];
 
           shellHook = ''
+            export LIBTORCH_USE_PYTORCH=1
+            # Native extensions in uv-managed Python wheels (NumPy/OpenCV)
+            # need the Nix-provided C++ and GLib runtimes at import time.
+            export LD_LIBRARY_PATH="${
+              pkgs.lib.makeLibraryPath [
+                pkgs.stdenv.cc.cc.lib
+                pkgs.glib
+              ]
+            }:$(python -c 'import torch; print(torch.__path__[0] + "/lib")'):''${LD_LIBRARY_PATH:-}"
             export CUDA_HOME="${cudaSymlinked}"
             export LIBCLANG_PATH="${llvmPkgs.libclang.lib}/lib"
             export CC="${pkgs.stdenv.cc}/bin/cc"
@@ -315,7 +340,19 @@
             # path: loading libcuda through a relocated symlink breaks WSL's
             # driver initialization with CUDA_ERROR_OPERATING_SYSTEM.
             elif [ -e /usr/lib/wsl/lib/libcuda.so.1 ]; then
-              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.wayland pkgs.libxkbcommon pkgs.libglvnd pkgs.libglvnd.dev pkgs.mesa pkgs.libx11 pkgs.libxcursor pkgs.libxi pkgs.libxrandr ]}:/usr/lib/wsl/lib:$LD_LIBRARY_PATH"
+              export LD_LIBRARY_PATH="${
+                pkgs.lib.makeLibraryPath [
+                  pkgs.wayland
+                  pkgs.libxkbcommon
+                  pkgs.libglvnd
+                  pkgs.libglvnd.dev
+                  pkgs.mesa
+                  pkgs.libx11
+                  pkgs.libxcursor
+                  pkgs.libxi
+                  pkgs.libxrandr
+                ]
+              }:/usr/lib/wsl/lib:$LD_LIBRARY_PATH"
               export __EGL_VENDOR_LIBRARY_DIRS="${pkgs.mesa}/share/glvnd/egl_vendor.d"
               # Use WSLg's D3D12-backed GL renderer.
               export WGPU_BACKEND=gl

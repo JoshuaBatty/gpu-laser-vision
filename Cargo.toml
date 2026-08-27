@@ -9,9 +9,12 @@ cutile-cuda-core = { git = "https://github.com/NVlabs/cutile-rs", rev = "d0d2ba9
 anyhow = "1"
 bevy = { version = "0.19.0", default-features = false }
 image = "0.25"
-nannou = { version = "0.20.0", features = ["video"] }
+nannou = { version = "0.20.0", features = ["egui", "video"] }
 cuda-async = { path = "../../crates/cuda-oxide/crates/cuda-async" }
 cuda-core = { path = "../../crates/cuda-oxide/crates/cuda-core" }
 cuda-device = { path = "../../crates/cuda-oxide/crates/cuda-device" }
 cuda-host = { path = "../../crates/cuda-oxide/crates/cuda-host" }
 nannou_laser = "0.20.0"
+# tch releases target one exact PyTorch C++ API version. This matches the
+# PyTorch 2.11.0 package pinned by flake.nix.
+tch = "=0.24.0"

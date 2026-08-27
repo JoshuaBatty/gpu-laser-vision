@@ -1,4 +1,4 @@
-//! CUDA kernels for the Canny edge detection pipeline.
+//! CUDA kernels for extracting colourized laser edges.
 
 use cuda_device::{DisjointSlice, cuda_module, kernel};
 pub use device::*;
@@ -6,6 +6,8 @@ pub use device::*;
 #[cuda_module]
 mod device {
     use super::*;
+
+    const COLOR_SAMPLE_DISTANCE: usize = 2;
 
     #[kernel]
     pub fn convert_to_grayscale(rgba: &[u8], mut b: DisjointSlice<f32>) {
@@ -75,150 +77,38 @@ mod device {
         }
     }
 
-    #[kernel]
-    pub fn non_maximum_suppression(
-        edges: &[f32],
-        grad_x: &[f32],
-        grad_y: &[f32],
-        mut thin_edges: DisjointSlice<f32>,
-        w: usize,
-        h: usize,
-    ) {
-        if let Some((thin_edge, idx)) = thin_edges.get_mut_indexed() {
-            let i = idx.get();
-            let x = i % w;
-            let y = i / w;
-
-            // Borders have no complete neighbourhood.
-            if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
-                *thin_edge = 0.0;
-                return;
-            }
-
-            let gx = grad_x[i];
-            let gy = grad_y[i];
-            let current = edges[i];
-
-            // Pick the two neighbours along the closest gradient direction.
-            let (before, after) = if gx.abs() >= gy.abs() {
-                if gy.abs() * 2.0 <= gx.abs() {
-                    (i - 1, i + 1) // horizontal
-                } else if gx * gy >= 0.0 {
-                    (i - w - 1, i + w + 1) // northwest ↔ southeast
-                } else {
-                    (i - w + 1, i + w - 1) // northeast ↔ southwest
-                }
-            } else if gx.abs() * 2.0 <= gy.abs() {
-                (i - w, i + w) // vertical
-            } else if gx * gy >= 0.0 {
-                (i - w - 1, i + w + 1) // northwest ↔ southeast
-            } else {
-                (i - w + 1, i + w - 1) // northeast ↔ southwest
-            };
-
-            // Keep only local maxima; suppress every other edge pixel.
-            *thin_edge = if current >= edges[before] && current >= edges[after] {
-                current
-            } else {
-                0.0
-            };
-        }
-    }
-
-    #[kernel]
-    pub fn double_threshold(
-        thin_edges: &[f32],
-        mut edge_classes: DisjointSlice<f32>,
-        low_threshold: f32,
-        high_threshold: f32,
-    ) {
-        if let Some((edge_class, idx)) = edge_classes.get_mut_indexed() {
-            let strength = thin_edges[idx.get()];
-
-            // 0.0 = no edge, 0.5 = weak edge, 1.0 = strong edge.
-            *edge_class = if strength >= high_threshold {
-                1.0
-            } else if strength >= low_threshold {
-                0.5
-            } else {
-                0.0
-            };
-        }
-    }
-
-    #[kernel]
-    pub fn hysteresis(
-        edge_classes: &[f32],
-        connected_edges: &[f32],
-        mut connected_edges_next: DisjointSlice<f32>,
-        w: usize,
-        h: usize,
-    ) {
-        if let Some((output, idx)) = connected_edges_next.get_mut_indexed() {
-            let i = idx.get();
-            let x = i % w;
-            let y = i / w;
-
-            // Strong edges and already-connected edges stay connected.
-            if edge_classes[i] == 1.0 || connected_edges[i] == 1.0 {
-                *output = 1.0;
-                return;
-            }
-
-            if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
-                *output = 0.0;
-                return;
-            }
-
-            // Promote weak pixels that touch the previous connected result.
-            let touches_connected = connected_edges[i - w - 1] == 1.0
-                || connected_edges[i - w] == 1.0
-                || connected_edges[i - w + 1] == 1.0
-                || connected_edges[i - 1] == 1.0
-                || connected_edges[i + 1] == 1.0
-                || connected_edges[i + w - 1] == 1.0
-                || connected_edges[i + w] == 1.0
-                || connected_edges[i + w + 1] == 1.0;
-
-            *output = if edge_classes[i] == 0.5 && touches_connected {
-                1.0
-            } else {
-                0.0
-            };
-        }
-    }
-
     /// Converts a normalized floating-point stage into display-ready bytes on the GPU.
     #[kernel]
-    pub fn normalized_f32_to_u8(input: &[f32], mut output: DisjointSlice<u8>, gain: f32) {
+    pub fn normalized_f32_to_u8(input: &[f32], mut output: DisjointSlice<u8>) {
         if let Some((output, idx)) = output.get_mut_indexed() {
-            *output = ((input[idx.get()] * gain).clamp(0.0, 1.0) * 255.0) as u8;
+            *output = (input[idx.get()].clamp(0.0, 1.0) * 255.0) as u8;
         }
     }
 
-    // Recover original image colours on the GPU before the live pipeline leaves image space.
+    /// Thresholds Scharr magnitudes and recovers source colours in one pass.
     #[kernel]
-    pub fn colorize_edges(
+    pub fn extract_laser_edges(
         rgba: &[u8],
-        connected_edges: &[f32],
+        edges: &[f32],
         grad_x: &[f32],
         grad_y: &[f32],
         mut edge_colors: DisjointSlice<u32>,
         w: usize,
-        h: usize,
-        sample_distance: usize,
+        thresholds: &[f32],
     ) {
         if let Some((edge_color, idx)) = edge_colors.get_mut_indexed() {
             let i = idx.get();
-            if connected_edges[i] == 0.0 {
+            let gx = grad_x[i];
+            let gy = grad_y[i];
+            let strength = edges[i];
+            if strength < thresholds[0] || strength > thresholds[1] {
                 *edge_color = 0;
                 return;
             }
 
             let x = i % w;
             let y = i / w;
-            let gx = grad_x[i];
-            let gy = grad_y[i];
+            let h = rgba.len() / 4 / w;
 
             // Quantize the gradient normal to horizontal, vertical, or diagonal.
             let (dx, dy): (isize, isize) = if gx.abs() >= gy.abs() {
@@ -237,10 +127,10 @@ mod device {
                 (1, -1)
             };
 
-            let plus_x = offset_coordinate(x, dx, sample_distance, w);
-            let plus_y = offset_coordinate(y, dy, sample_distance, h);
-            let minus_x = offset_coordinate(x, -dx, sample_distance, w);
-            let minus_y = offset_coordinate(y, -dy, sample_distance, h);
+            let plus_x = offset_coordinate(x, dx, COLOR_SAMPLE_DISTANCE, w);
+            let plus_y = offset_coordinate(y, dy, COLOR_SAMPLE_DISTANCE, h);
+            let minus_x = offset_coordinate(x, -dx, COLOR_SAMPLE_DISTANCE, w);
+            let minus_y = offset_coordinate(y, -dy, COLOR_SAMPLE_DISTANCE, h);
 
             let center = i;
             let plus = plus_y * w + plus_x;
@@ -259,7 +149,8 @@ mod device {
             let source = selected * 4;
             *edge_color = rgba[source] as u32
                 | (rgba[source + 1] as u32) << 8
-                | (rgba[source + 2] as u32) << 16;
+                | (rgba[source + 2] as u32) << 16
+                | 0xff << 24;
         }
     }
 
