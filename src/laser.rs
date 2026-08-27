@@ -71,6 +71,7 @@ fn run(frame_model: FrameModel, status: Arc<Mutex<String>>, stop_rx: mpsc::Recei
         return set_error(&status, error);
     }
 
+    // Timed discovery polling keeps shutdown observable while no DAC is present.
     let dac = loop {
         if stop_rx.try_recv().is_ok() {
             return;
@@ -97,6 +98,7 @@ fn run(frame_model: FrameModel, status: Arc<Mutex<String>>, stop_rx: mpsc::Recei
     };
 
     set_status(&status, format!("streaming to {dac_name}"));
+    // The stream owns transmission until the application requests shutdown.
     let _ = stop_rx.recv();
     drop(stream);
 }

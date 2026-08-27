@@ -1,3 +1,8 @@
+//! Real-time CUDA and YOLO vision demo for laser path generation.
+//!
+//! The binary coordinates video playback, persistent GPU pipelines, dashboard
+//! state, path generation, and Ether Dream streaming.
+
 mod cuda_graph;
 mod edge_detection;
 mod interface;
@@ -22,6 +27,7 @@ const PRESENTATION_WIDTH: u32 = 1280;
 const PRESENTATION_HEIGHT: u32 = 720;
 type AppModel = Result<Model, String>;
 
+/// Long-lived application state shared by the renderer and video pipeline.
 struct Model {
     cuda_laser_path: path_generation::LaserPath,
     laser: laser::EtherDreamStream,
@@ -40,6 +46,7 @@ struct EdgeThresholds {
     max: f32,
 }
 
+/// Timings for one frame, an accumulated window, or its averaged snapshot.
 #[derive(Clone, Copy, Default)]
 struct PipelineTimingSample {
     frame_copy_ms: f64,
@@ -78,6 +85,7 @@ impl PipelineTimingSample {
     }
 }
 
+/// Stable metrics snapshot displayed by the dashboard.
 #[derive(Clone, Copy, Default)]
 struct PipelineMetrics {
     fps: f64,
@@ -94,9 +102,11 @@ impl Default for EdgeThresholds {
     }
 }
 
+/// Connects Bevy's video entity to state consumed by the nannou view.
 #[derive(Component, Clone)]
 struct VideoBridge(Arc<Mutex<VideoBridgeState>>);
 
+/// Latest video outputs and metrics published across the Bevy/nannou boundary.
 #[derive(Default)]
 struct VideoBridgeState {
     image: Option<Handle<Image>>,
@@ -112,18 +122,21 @@ struct VideoBridgeState {
     thresholds: EdgeThresholds,
 }
 
+/// GPU resources reused across video frames.
 #[derive(Default)]
 struct VideoVisionPipeline {
     detector: Option<edge_detection::CudaEdgeDetector>,
     yolo: Option<yolo::YoloSegmenter>,
 }
 
+/// Display textures and laser paths produced for the latest video frame.
 struct ProcessedVideoFrame {
     panels: [ImagePanel; 6],
     cuda_laser_path: path_generation::LaserPath,
     yolo_laser_path: path_generation::LaserPath,
 }
 
+/// Installs live video processing into Bevy's post-update schedule.
 struct VideoBridgePlugin;
 
 impl Plugin for VideoBridgePlugin {
@@ -183,6 +196,7 @@ fn model(app: &App) -> AppModel {
     })
 }
 
+/// Processes each newly decoded frame through YOLO, CUDA, and path generation.
 fn process_video_frames(
     outputs: Query<(&VideoOutput, &VideoBridge), Changed<VideoOutput>>,
     mut assets: ResMut<Assets<Image>>,
@@ -190,6 +204,7 @@ fn process_video_frames(
     mut pipeline: NonSendMut<VideoVisionPipeline>,
 ) {
     for (output, bridge) in &outputs {
+        // Publish the source texture immediately and adopt its dimensions once.
         {
             let mut video = lock_video(&bridge.0);
             video.image = Some(output.image.clone());
@@ -220,6 +235,7 @@ fn process_video_frames(
         };
         let frame_copy_ms = frame_copy_started.elapsed().as_secs_f64() * 1_000.0;
 
+        // Load the fixed YOLO model once.
         if pipeline.yolo.is_none() {
             match yolo::YoloSegmenter::load(yolo::DEFAULT_MODEL_PATH) {
                 Ok(segmenter) => pipeline.yolo = Some(segmenter),
@@ -246,6 +262,7 @@ fn process_video_frames(
         let yolo_confidence = yolo_frame.confidence;
 
         let dimensions = (frame.width(), frame.height());
+        // Rebuild the captured CUDA graph only when frame dimensions change.
         if pipeline
             .detector
             .as_ref()
@@ -286,6 +303,7 @@ fn process_video_frames(
                     &yolo_frame.contour_pixels,
                 );
                 let yolo_path_ms = yolo_path_started.elapsed().as_secs_f64() * 1_000.0;
+                // Publish one coherent frame before rolling the metrics window.
                 let mut video = lock_video(&bridge.0);
                 let cuda_point_count = cuda_laser_path.point_count();
                 let yolo_point_count = yolo_laser_path.point_count();
@@ -404,6 +422,7 @@ fn update_processed_frame(
     update_luma_panel(laser_edges, images.laser_edges, assets);
 }
 
+/// Updates an RGB preview in place, replacing the asset only if its handle is stale.
 fn update_rgb_panel(panel: &mut ImagePanel, image: image::RgbImage, assets: &mut Assets<Image>) {
     if let Some(mut current) = assets.get_mut(&panel.image) {
         let source = image.into_raw();
@@ -423,6 +442,7 @@ fn update_rgb_panel(panel: &mut ImagePanel, image: image::RgbImage, assets: &mut
     ));
 }
 
+/// Updates a grayscale preview in place, replacing the asset only if its handle is stale.
 fn update_luma_panel(panel: &mut ImagePanel, image: image::GrayImage, assets: &mut Assets<Image>) {
     if let Some(mut current) = assets.get_mut(&panel.image) {
         let source = image.into_raw();
