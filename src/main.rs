@@ -24,7 +24,7 @@ const CONTROL_PANEL_WIDTH: f32 = 220.0;
 type AppModel = Result<Model, String>;
 
 struct Model {
-    panels: [ImagePanel; 5],
+    panels: Vec<ImagePanel>,
     laser_path: path_generation::LaserPath,
     laser: laser::EtherDreamStream,
     video: Arc<Mutex<VideoBridgeState>>,
@@ -69,12 +69,13 @@ struct VideoBridgeState {
 }
 
 #[derive(Default)]
-struct VideoCudaPipeline {
+struct VideoVisionPipeline {
     detector: Option<edge_detection::CudaEdgeDetector>,
+    yolo: Option<yolo::YoloSegmenter>,
 }
 
 struct ProcessedVideoFrame {
-    panels: [ImagePanel; 5],
+    panels: Vec<ImagePanel>,
     laser_path: path_generation::LaserPath,
 }
 
@@ -82,7 +83,7 @@ struct VideoBridgePlugin;
 
 impl Plugin for VideoBridgePlugin {
     fn build(&self, app: &mut BevyApp) {
-        app.insert_non_send(VideoCudaPipeline::default())
+        app.insert_non_send(VideoVisionPipeline::default())
             .add_systems(PostUpdate, process_video_frames);
     }
 }
@@ -106,24 +107,6 @@ fn model(app: &App) -> AppModel {
         eprintln!("Edge detection failed: {error}");
         error
     })?;
-    let yolo = yolo::YoloSegmenter::load(yolo::DEFAULT_MODEL_PATH).map_err(|error| {
-        let error = format!("{error:#}");
-        eprintln!("YOLO setup failed: {error}");
-        error
-    })?;
-    let yolo_output = yolo.infer(&images.original).map_err(|error| {
-        let error = format!("{error:#}");
-        eprintln!("YOLO inference failed: {error}");
-        error
-    })?;
-    println!(
-        "YOLO11 segmentation: predictions {:?}, prototypes {:?}, letterbox scale {:.3}, pad ({}, {})",
-        yolo_output.predictions.size(),
-        yolo_output.prototypes.size(),
-        yolo_output.transform.scale,
-        yolo_output.transform.pad_x,
-        yolo_output.transform.pad_y,
-    );
     let laser_path = path_generation::from_edge_mask(&images.laser_edges, &images.edge_colors);
     let laser = laser::EtherDreamStream::start(&laser_path);
     let video = Arc::new(Mutex::new(VideoBridgeState::default()));
@@ -162,7 +145,7 @@ fn process_video_frames(
     outputs: Query<(&VideoOutput, &VideoBridge), Changed<VideoOutput>>,
     mut assets: ResMut<Assets<Image>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
-    mut pipeline: NonSendMut<VideoCudaPipeline>,
+    mut pipeline: NonSendMut<VideoVisionPipeline>,
 ) {
     for (output, bridge) in &outputs {
         {
@@ -192,6 +175,32 @@ fn process_video_frames(
             continue;
         };
 
+        let frame_started = Instant::now();
+        if pipeline.yolo.is_none() {
+            match yolo::YoloSegmenter::load(yolo::DEFAULT_MODEL_PATH) {
+                Ok(segmenter) => pipeline.yolo = Some(segmenter),
+                Err(error) => {
+                    lock_video(&bridge.0).error = Some(format!("YOLO setup failed: {error:#}"));
+                    continue;
+                }
+            }
+        }
+        let yolo_started = Instant::now();
+        let yolo_frame = match pipeline
+            .yolo
+            .as_ref()
+            .expect("YOLO was initialized")
+            .infer(&frame)
+        {
+            Ok(frame) => frame,
+            Err(error) => {
+                lock_video(&bridge.0).error = Some(format!("YOLO inference failed: {error:#}"));
+                continue;
+            }
+        };
+        let yolo_ms = yolo_started.elapsed().as_secs_f64() * 1_000.0;
+        let yolo_confidence = yolo_frame.confidence;
+
         let dimensions = (frame.width(), frame.height());
         if pipeline
             .detector
@@ -214,7 +223,6 @@ fn process_video_frames(
             .as_mut()
             .expect("detector was initialized");
         let thresholds = lock_video(&bridge.0).thresholds;
-        let frame_started = Instant::now();
         match detector.process(&frame, thresholds.min, thresholds.max) {
             Ok(images) => {
                 let laser_path =
@@ -235,12 +243,13 @@ fn process_video_frames(
                     update_processed_frame(
                         processed,
                         images,
+                        yolo_frame,
                         laser_path,
                         upload_debug,
                         &mut assets,
                     );
                 } else {
-                    let panels = image_panels(images, |image| {
+                    let panels = live_image_panels(images, yolo_frame, |image| {
                         assets.add(Image::from_dynamic(
                             image,
                             true,
@@ -251,9 +260,12 @@ fn process_video_frames(
                 }
                 video.error = None;
                 if !video.reported_first_frame {
+                    let detection = yolo_confidence
+                        .map(|confidence| format!("person {confidence:.2}"))
+                        .unwrap_or_else(|| "no person".into());
                     println!(
-                        "First frame: {:.1} ms | {point_count} laser points",
-                        frame_started.elapsed().as_secs_f64() * 1_000.0
+                        "First frame: {:.1} ms ({yolo_ms:.1} ms YOLO, {detection}) | {point_count} laser points",
+                        frame_started.elapsed().as_secs_f64() * 1_000.0,
                     );
                     video.reported_first_frame = true;
                 }
@@ -262,9 +274,12 @@ fn process_video_frames(
                 video.processed_frames += 1;
                 let elapsed = now.duration_since(started).as_secs_f64();
                 if elapsed >= 2.0 {
+                    let detection = yolo_confidence
+                        .map(|confidence| format!("person {confidence:.2}"))
+                        .unwrap_or_else(|| "no person".into());
                     println!(
-                        "Pipeline: {:.1} FPS | {point_count} laser points",
-                        video.processed_frames as f64 / elapsed
+                        "Pipeline: {:.1} FPS | {yolo_ms:.1} ms YOLO ({detection}) | {point_count} laser points",
+                        video.processed_frames as f64 / elapsed,
                     );
                     video.fps_window_started = Some(now);
                     video.processed_frames = 0;
@@ -280,6 +295,7 @@ fn process_video_frames(
 fn update_processed_frame(
     processed: &mut ProcessedVideoFrame,
     images: edge_detection::EdgeDetectionImages,
+    yolo_frame: yolo::YoloFrame,
     laser_path: path_generation::LaserPath,
     upload_debug: bool,
     assets: &mut Assets<Image>,
@@ -290,7 +306,8 @@ fn update_processed_frame(
     }
 
     let images = [
-        image::DynamicImage::ImageRgba8(images.original),
+        image::DynamicImage::ImageLuma8(yolo_frame.person_mask),
+        image::DynamicImage::ImageLuma8(yolo_frame.contour),
         image::DynamicImage::ImageLuma8(images.grayscale),
         image::DynamicImage::ImageLuma8(images.edges),
         image::DynamicImage::ImageLuma8(images.laser_edges),
@@ -310,11 +327,44 @@ fn update_processed_frame(
 fn image_panels(
     images: edge_detection::EdgeDetectionImages,
     mut upload: impl FnMut(image::DynamicImage) -> Handle<Image>,
-) -> [ImagePanel; 5] {
-    [
+) -> Vec<ImagePanel> {
+    vec![
         ImagePanel {
             label: "Original",
             image: upload(image::DynamicImage::ImageRgba8(images.original)),
+        },
+        ImagePanel {
+            label: "Grayscale",
+            image: upload(image::DynamicImage::ImageLuma8(images.grayscale)),
+        },
+        ImagePanel {
+            label: "Scharr magnitude",
+            image: upload(image::DynamicImage::ImageLuma8(images.edges)),
+        },
+        ImagePanel {
+            label: "Laser edge mask",
+            image: upload(image::DynamicImage::ImageLuma8(images.laser_edges)),
+        },
+        ImagePanel {
+            label: "GPU edge colours",
+            image: upload(image::DynamicImage::ImageRgb8(images.edge_colors)),
+        },
+    ]
+}
+
+fn live_image_panels(
+    images: edge_detection::EdgeDetectionImages,
+    yolo_frame: yolo::YoloFrame,
+    mut upload: impl FnMut(image::DynamicImage) -> Handle<Image>,
+) -> Vec<ImagePanel> {
+    vec![
+        ImagePanel {
+            label: "YOLO person mask",
+            image: upload(image::DynamicImage::ImageLuma8(yolo_frame.person_mask)),
+        },
+        ImagePanel {
+            label: "YOLO contour",
+            image: upload(image::DynamicImage::ImageLuma8(yolo_frame.contour)),
         },
         ImagePanel {
             label: "Grayscale",
