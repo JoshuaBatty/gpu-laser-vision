@@ -29,7 +29,6 @@ struct Model {
     laser: laser::EtherDreamStream,
     video: Arc<Mutex<VideoBridgeState>>,
     video_label: &'static str,
-    _yolo: yolo::YoloSegmenter,
 }
 
 #[derive(Clone)]
@@ -156,7 +155,6 @@ fn model(app: &App) -> AppModel {
         laser,
         video,
         video_label,
-        _yolo: yolo,
     })
 }
 
@@ -343,7 +341,7 @@ fn lock_video(video: &Mutex<VideoBridgeState>) -> MutexGuard<'_, VideoBridgeStat
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn view(app: &App, model: &AppModel, _window: Entity) {
+fn view(app: &App, model: &AppModel, window_entity: Entity) {
     let draw = app.draw();
     let window = app.window_rect();
     draw.background().color(Color::srgb_u8(12, 14, 16));
@@ -363,7 +361,7 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
         }
     };
     let mut video = lock_video(&model.video);
-    let egui_context = app.egui();
+    let egui_context = app.egui_for_window(window_entity);
     let mut egui_viewport = egui::Ui::new(
         egui_context.clone(),
         "edge_threshold_viewport".into(),
