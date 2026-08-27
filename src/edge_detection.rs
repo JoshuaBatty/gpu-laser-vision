@@ -10,7 +10,9 @@ use cutile_cuda_async::error::DeviceError;
 use image::{GrayImage, ImageReader, RgbImage, RgbaImage};
 use std::{fmt::Display, path::Path, sync::Arc};
 
+/// Inclusive lower bound for normalized Scharr magnitudes.
 pub const DEFAULT_MIN_THRESHOLD: f32 = 0.5;
+/// Inclusive upper bound for normalized Scharr magnitudes.
 pub const DEFAULT_MAX_THRESHOLD: f32 = 1.0;
 
 /// Images produced by the GPU edge-detection pipeline.

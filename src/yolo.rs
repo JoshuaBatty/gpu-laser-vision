@@ -82,6 +82,7 @@ impl YoloSegmenter {
             .source_dimensions
             .is_some_and(|previous| previous != dimensions)
         {
+            // A new letterbox shape can expose padding left by the previous frame.
             let _ = self.input.fill_(114.0 / 255.0);
         }
         self.source_dimensions = Some(dimensions);
@@ -104,6 +105,7 @@ impl YoloSegmenter {
     }
 }
 
+/// Scale and padding needed to map model-space masks back to the source frame.
 #[derive(Clone, Copy)]
 struct LetterboxTransform {
     source_width: u32,
@@ -115,6 +117,7 @@ struct LetterboxTransform {
     pad_y: u32,
 }
 
+/// Source-frame region containing the selected instance mask.
 #[derive(Clone, Copy)]
 struct MaskBounds {
     left: usize,
@@ -389,6 +392,7 @@ fn foreground_color(
 
     let x = index % width;
     let y = index / width;
+    // Search outward inside the mask for the strongest non-green laser colour.
     for radius in 1..=CONTOUR_COLOR_SEARCH_RADIUS {
         let mut best = None;
         for offset_y in -radius..=radius {
