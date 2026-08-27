@@ -18,7 +18,6 @@ const SOURCE_IMAGE: &str = "assets/test_tiles.png";
 const PREFERRED_VIDEO_ASSET: &str = "jcvd_green_screen_720p.mp4";
 const FALLBACK_VIDEO_ASSET: &str = "big_buck_bunny_720p.mp4";
 const COLUMNS: usize = 3;
-const DEBUG_UPLOAD_INTERVAL: u64 = 3;
 const CONTROL_PANEL_WIDTH: f32 = 220.0;
 
 type AppModel = Result<Model, String>;
@@ -52,6 +51,44 @@ struct EdgeThresholds {
     max: f32,
 }
 
+#[derive(Clone, Copy, Default)]
+struct PipelineTimingSample {
+    frame_copy_ms: f64,
+    yolo_ms: f64,
+    cuda_edges_ms: f64,
+    cuda_path_ms: f64,
+    yolo_path_ms: f64,
+    debug_upload_ms: f64,
+    total_ms: f64,
+}
+
+impl std::ops::AddAssign for PipelineTimingSample {
+    fn add_assign(&mut self, sample: Self) {
+        self.frame_copy_ms += sample.frame_copy_ms;
+        self.yolo_ms += sample.yolo_ms;
+        self.cuda_edges_ms += sample.cuda_edges_ms;
+        self.cuda_path_ms += sample.cuda_path_ms;
+        self.yolo_path_ms += sample.yolo_path_ms;
+        self.debug_upload_ms += sample.debug_upload_ms;
+        self.total_ms += sample.total_ms;
+    }
+}
+
+impl PipelineTimingSample {
+    fn averaged_over(self, frames: u64) -> Self {
+        let frames = frames.max(1) as f64;
+        Self {
+            frame_copy_ms: self.frame_copy_ms / frames,
+            yolo_ms: self.yolo_ms / frames,
+            cuda_edges_ms: self.cuda_edges_ms / frames,
+            cuda_path_ms: self.cuda_path_ms / frames,
+            yolo_path_ms: self.yolo_path_ms / frames,
+            debug_upload_ms: self.debug_upload_ms / frames,
+            total_ms: self.total_ms / frames,
+        }
+    }
+}
+
 impl Default for EdgeThresholds {
     fn default() -> Self {
         Self {
@@ -72,8 +109,8 @@ struct VideoBridgeState {
     window_sized: bool,
     fps_window_started: Option<Instant>,
     processed_frames: u64,
+    timing_totals: PipelineTimingSample,
     reported_first_frame: bool,
-    debug_upload_counter: u64,
     thresholds: EdgeThresholds,
 }
 
@@ -117,7 +154,11 @@ fn model(app: &App) -> AppModel {
         eprintln!("Edge detection failed: {error}");
         error
     })?;
-    let cuda_laser_path = path_generation::from_edge_mask(&images.laser_edges, &images.edge_colors);
+    let cuda_laser_path = path_generation::from_edge_mask(
+        &images.laser_edges,
+        &images.edge_colors,
+        &images.edge_pixels,
+    );
     let laser = laser::EtherDreamStream::start(&cuda_laser_path);
     let video = Arc::new(Mutex::new(VideoBridgeState::default()));
     let (video_asset_name, video_label) = if app.assets_path().join(PREFERRED_VIDEO_ASSET).is_file()
@@ -161,16 +202,18 @@ fn process_video_frames(
         {
             let mut video = lock_video(&bridge.0);
             video.image = Some(output.image.clone());
-            if !video.window_sized {
-                if let Ok(mut window) = windows.single_mut() {
-                    window
-                        .resolution
-                        .set(output.size.x as f32, output.size.y as f32);
-                    video.window_sized = true;
-                }
+            if !video.window_sized
+                && let Ok(mut window) = windows.single_mut()
+            {
+                window
+                    .resolution
+                    .set(output.size.x as f32, output.size.y as f32);
+                video.window_sized = true;
             }
         }
 
+        let frame_started = Instant::now();
+        let frame_copy_started = Instant::now();
         let frame = {
             let Some(image) = assets.get(&output.image) else {
                 continue;
@@ -184,8 +227,8 @@ fn process_video_frames(
             lock_video(&bridge.0).error = Some("video frame dimensions are invalid".into());
             continue;
         };
+        let frame_copy_ms = frame_copy_started.elapsed().as_secs_f64() * 1_000.0;
 
-        let frame_started = Instant::now();
         if pipeline.yolo.is_none() {
             match yolo::YoloSegmenter::load(yolo::DEFAULT_MODEL_PATH) {
                 Ok(segmenter) => pipeline.yolo = Some(segmenter),
@@ -198,7 +241,7 @@ fn process_video_frames(
         let yolo_started = Instant::now();
         let yolo_frame = match pipeline
             .yolo
-            .as_ref()
+            .as_mut()
             .expect("YOLO was initialized")
             .infer(&frame)
         {
@@ -233,27 +276,29 @@ fn process_video_frames(
             .as_mut()
             .expect("detector was initialized");
         let thresholds = lock_video(&bridge.0).thresholds;
-        match detector.process(&frame, thresholds.min, thresholds.max) {
+        let cuda_edges_started = Instant::now();
+        let cuda_images = detector.process(frame, thresholds.min, thresholds.max);
+        let cuda_edges_ms = cuda_edges_started.elapsed().as_secs_f64() * 1_000.0;
+        match cuda_images {
             Ok(images) => {
-                let cuda_laser_path =
-                    path_generation::from_edge_mask(&images.laser_edges, &images.edge_colors);
+                let cuda_path_started = Instant::now();
+                let cuda_laser_path = path_generation::from_edge_mask(
+                    &images.laser_edges,
+                    &images.edge_colors,
+                    &images.edge_pixels,
+                );
+                let cuda_path_ms = cuda_path_started.elapsed().as_secs_f64() * 1_000.0;
+                let yolo_path_started = Instant::now();
                 let yolo_laser_path = path_generation::from_edge_mask(
                     &yolo_frame.contour,
                     &yolo_frame.colored_contour,
+                    &yolo_frame.contour_pixels,
                 );
+                let yolo_path_ms = yolo_path_started.elapsed().as_secs_f64() * 1_000.0;
                 let mut video = lock_video(&bridge.0);
                 let cuda_point_count = cuda_laser_path.point_count();
                 let yolo_point_count = yolo_laser_path.point_count();
-                let upload_debug = if video.processed.is_some() {
-                    video.debug_upload_counter += 1;
-                    let upload = video.debug_upload_counter >= DEBUG_UPLOAD_INTERVAL;
-                    if upload {
-                        video.debug_upload_counter = 0;
-                    }
-                    upload
-                } else {
-                    true
-                };
+                let debug_upload_started = Instant::now();
                 if let Some(processed) = &mut video.processed {
                     update_processed_frame(
                         processed,
@@ -261,7 +306,6 @@ fn process_video_frames(
                         yolo_frame,
                         cuda_laser_path,
                         yolo_laser_path,
-                        upload_debug,
                         &mut assets,
                     );
                 } else {
@@ -278,6 +322,17 @@ fn process_video_frames(
                         yolo_laser_path,
                     });
                 }
+                let debug_upload_ms = debug_upload_started.elapsed().as_secs_f64() * 1_000.0;
+                let total_ms = frame_started.elapsed().as_secs_f64() * 1_000.0;
+                video.timing_totals += PipelineTimingSample {
+                    frame_copy_ms,
+                    yolo_ms,
+                    cuda_edges_ms,
+                    cuda_path_ms,
+                    yolo_path_ms,
+                    debug_upload_ms,
+                    total_ms,
+                };
                 video.error = None;
                 if !video.reported_first_frame {
                     let detection = yolo_confidence
@@ -301,8 +356,20 @@ fn process_video_frames(
                         "Pipeline: {:.1} FPS | {yolo_ms:.1} ms YOLO ({detection}) | CUDA {cuda_point_count} points | YOLO {yolo_point_count} points",
                         video.processed_frames as f64 / elapsed,
                     );
+                    let average = video.timing_totals.averaged_over(video.processed_frames);
+                    println!(
+                        "Stages: {:.1} total | {:.1} YOLO | {:.1} CUDA edges | {:.1} CUDA path | {:.1} YOLO path | {:.1} frame copy | {:.1} debug upload ms",
+                        average.total_ms,
+                        average.yolo_ms,
+                        average.cuda_edges_ms,
+                        average.cuda_path_ms,
+                        average.yolo_path_ms,
+                        average.frame_copy_ms,
+                        average.debug_upload_ms,
+                    );
                     video.fps_window_started = Some(now);
                     video.processed_frames = 0;
+                    video.timing_totals = PipelineTimingSample::default();
                 }
             }
             Err(error) => {
@@ -318,38 +385,71 @@ fn update_processed_frame(
     yolo_frame: yolo::YoloFrame,
     cuda_laser_path: path_generation::LaserPath,
     yolo_laser_path: path_generation::LaserPath,
-    upload_debug: bool,
     assets: &mut Assets<Image>,
 ) {
     processed.cuda_laser_path = cuda_laser_path;
     processed.yolo_laser_path = yolo_laser_path;
-    if !upload_debug {
+    let previews = images.previews;
+
+    let [
+        cuda_contour,
+        yolo_contour,
+        yolo_mask,
+        grayscale,
+        edges,
+        laser_edges,
+    ] = &mut processed.panels;
+    update_rgb_panel(cuda_contour, images.edge_colors, assets);
+    update_rgb_panel(yolo_contour, yolo_frame.colored_contour, assets);
+    update_luma_panel(yolo_mask, yolo_frame.person_mask, assets);
+    update_luma_panel(grayscale, previews.grayscale, assets);
+    update_luma_panel(edges, previews.edges, assets);
+    update_luma_panel(laser_edges, images.laser_edges, assets);
+}
+
+fn update_rgb_panel(panel: &mut ImagePanel, image: image::RgbImage, assets: &mut Assets<Image>) {
+    if let Some(mut current) = assets.get_mut(&panel.image) {
+        let source = image.into_raw();
+        let target = current.data.get_or_insert_with(Vec::new);
+        target.resize(source.len() / 3 * 4, 255);
+        for (source, target) in source.chunks_exact(3).zip(target.chunks_exact_mut(4)) {
+            target[..3].copy_from_slice(source);
+            target[3] = 255;
+        }
         return;
     }
 
-    let images = [
-        image::DynamicImage::ImageRgb8(images.edge_colors),
-        image::DynamicImage::ImageRgb8(yolo_frame.colored_contour),
-        image::DynamicImage::ImageLuma8(yolo_frame.person_mask),
-        image::DynamicImage::ImageLuma8(images.grayscale),
-        image::DynamicImage::ImageLuma8(images.edges),
-        image::DynamicImage::ImageLuma8(images.laser_edges),
-    ];
+    panel.image = assets.add(Image::from_dynamic(
+        image::DynamicImage::ImageRgb8(image),
+        true,
+        RenderAssetUsages::default(),
+    ));
+}
 
-    for (panel, image) in processed.panels.iter_mut().zip(images) {
-        let image = Image::from_dynamic(image, true, RenderAssetUsages::default());
-        if let Some(mut current) = assets.get_mut(&panel.image) {
-            current.data = image.data;
-        } else {
-            panel.image = assets.add(image);
+fn update_luma_panel(panel: &mut ImagePanel, image: image::GrayImage, assets: &mut Assets<Image>) {
+    if let Some(mut current) = assets.get_mut(&panel.image) {
+        let source = image.into_raw();
+        let target = current.data.get_or_insert_with(Vec::new);
+        target.resize(source.len() * 4, 255);
+        for (&source, target) in source.iter().zip(target.chunks_exact_mut(4)) {
+            target.fill(source);
+            target[3] = 255;
         }
+        return;
     }
+
+    panel.image = assets.add(Image::from_dynamic(
+        image::DynamicImage::ImageLuma8(image),
+        true,
+        RenderAssetUsages::default(),
+    ));
 }
 
 fn image_panels(
     images: edge_detection::EdgeDetectionImages,
     mut upload: impl FnMut(image::DynamicImage) -> Handle<Image>,
 ) -> Vec<ImagePanel> {
+    let previews = images.previews;
     vec![
         ImagePanel {
             label: "Original",
@@ -357,11 +457,11 @@ fn image_panels(
         },
         ImagePanel {
             label: "Grayscale",
-            image: upload(image::DynamicImage::ImageLuma8(images.grayscale)),
+            image: upload(image::DynamicImage::ImageLuma8(previews.grayscale)),
         },
         ImagePanel {
             label: "Scharr magnitude",
-            image: upload(image::DynamicImage::ImageLuma8(images.edges)),
+            image: upload(image::DynamicImage::ImageLuma8(previews.edges)),
         },
         ImagePanel {
             label: "Laser edge mask",
@@ -379,6 +479,7 @@ fn live_image_panels(
     yolo_frame: yolo::YoloFrame,
     mut upload: impl FnMut(image::DynamicImage) -> Handle<Image>,
 ) -> [ImagePanel; 6] {
+    let previews = images.previews;
     [
         ImagePanel {
             label: "CUDA colored contour",
@@ -394,11 +495,11 @@ fn live_image_panels(
         },
         ImagePanel {
             label: "Grayscale",
-            image: upload(image::DynamicImage::ImageLuma8(images.grayscale)),
+            image: upload(image::DynamicImage::ImageLuma8(previews.grayscale)),
         },
         ImagePanel {
             label: "Scharr magnitude",
-            image: upload(image::DynamicImage::ImageLuma8(images.edges)),
+            image: upload(image::DynamicImage::ImageLuma8(previews.edges)),
         },
         ImagePanel {
             label: "CUDA edge mask",
