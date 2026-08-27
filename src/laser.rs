@@ -1,9 +1,11 @@
 //! Ether Dream discovery and laser frame streaming.
 
-use std::io::ErrorKind;
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
-use std::time::Duration;
+use std::{
+    io::ErrorKind,
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Duration,
+};
 
 use nannou_laser::{DacId, DetectedDac, Frame, Point};
 
@@ -16,7 +18,7 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct EtherDreamStream {
     status: Arc<Mutex<String>>,
     stop_tx: mpsc::Sender<()>,
-    _worker: thread::JoinHandle<()>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl EtherDreamStream {
@@ -34,22 +36,25 @@ impl EtherDreamStream {
         Self {
             status,
             stop_tx,
-            _worker: worker,
+            worker: Some(worker),
         }
     }
 
     /// Returns the latest discovery or stream status for display.
     pub fn status(&self) -> String {
-        self.status
-            .lock()
-            .map(|status| status.clone())
-            .unwrap_or_else(|_| String::from("status unavailable"))
+        self.status.lock().map_or_else(
+            |_| String::from("status unavailable"),
+            |status| status.clone(),
+        )
     }
 }
 
 impl Drop for EtherDreamStream {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -58,6 +63,8 @@ struct FrameModel {
     lines: Vec<Vec<Point>>,
 }
 
+// The worker owns these values so the stream and shutdown channel remain valid.
+#[allow(clippy::needless_pass_by_value)]
 fn run(frame_model: FrameModel, status: Arc<Mutex<String>>, stop_rx: mpsc::Receiver<()>) {
     let api = nannou_laser::Api::new();
     let mut detected_dacs = match api.detect_dacs() {
@@ -68,6 +75,7 @@ fn run(frame_model: FrameModel, status: Arc<Mutex<String>>, stop_rx: mpsc::Recei
         return set_error(&status, error);
     }
 
+    // Timed discovery polling keeps shutdown observable while no DAC is present.
     let dac = loop {
         if stop_rx.try_recv().is_ok() {
             return;
@@ -94,6 +102,7 @@ fn run(frame_model: FrameModel, status: Arc<Mutex<String>>, stop_rx: mpsc::Recei
     };
 
     set_status(&status, format!("streaming to {dac_name}"));
+    // The stream owns transmission until the application requests shutdown.
     let _ = stop_rx.recv();
     drop(stream);
 }
