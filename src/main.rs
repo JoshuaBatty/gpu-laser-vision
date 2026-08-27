@@ -3,6 +3,7 @@ mod edge_detection;
 mod kernels;
 mod laser;
 mod path_generation;
+mod yolo;
 
 use bevy::app::{App as BevyApp, Plugin, PostUpdate};
 use bevy::window::{PrimaryWindow, Window};
@@ -14,22 +15,42 @@ use std::{
 };
 
 const SOURCE_IMAGE: &str = "assets/test_tiles.png";
+const PREFERRED_VIDEO_ASSET: &str = "jcvd_green_screen_720p.mp4";
+const FALLBACK_VIDEO_ASSET: &str = "big_buck_bunny_720p.mp4";
 const COLUMNS: usize = 3;
 const DEBUG_UPLOAD_INTERVAL: u64 = 3;
+const CONTROL_PANEL_WIDTH: f32 = 220.0;
 
 type AppModel = Result<Model, String>;
 
 struct Model {
-    panels: [ImagePanel; 8],
+    panels: [ImagePanel; 5],
     laser_path: path_generation::LaserPath,
     laser: laser::EtherDreamStream,
     video: Arc<Mutex<VideoBridgeState>>,
+    video_label: &'static str,
+    _yolo: yolo::YoloSegmenter,
 }
 
 #[derive(Clone)]
 struct ImagePanel {
     label: &'static str,
     image: Handle<Image>,
+}
+
+#[derive(Clone, Copy)]
+struct EdgeThresholds {
+    min: f32,
+    max: f32,
+}
+
+impl Default for EdgeThresholds {
+    fn default() -> Self {
+        Self {
+            min: edge_detection::DEFAULT_MIN_THRESHOLD,
+            max: edge_detection::DEFAULT_MAX_THRESHOLD,
+        }
+    }
 }
 
 #[derive(Component, Clone)]
@@ -45,6 +66,7 @@ struct VideoBridgeState {
     processed_frames: u64,
     reported_first_frame: bool,
     debug_upload_counter: u64,
+    thresholds: EdgeThresholds,
 }
 
 #[derive(Default)]
@@ -53,7 +75,7 @@ struct VideoCudaPipeline {
 }
 
 struct ProcessedVideoFrame {
-    panels: [ImagePanel; 8],
+    panels: [ImagePanel; 5],
     laser_path: path_generation::LaserPath,
 }
 
@@ -85,10 +107,34 @@ fn model(app: &App) -> AppModel {
         eprintln!("Edge detection failed: {error}");
         error
     })?;
+    let yolo = yolo::YoloSegmenter::load(yolo::DEFAULT_MODEL_PATH).map_err(|error| {
+        let error = format!("{error:#}");
+        eprintln!("YOLO setup failed: {error}");
+        error
+    })?;
+    let yolo_output = yolo.infer(&images.original).map_err(|error| {
+        let error = format!("{error:#}");
+        eprintln!("YOLO inference failed: {error}");
+        error
+    })?;
+    println!(
+        "YOLO11 segmentation: predictions {:?}, prototypes {:?}, letterbox scale {:.3}, pad ({}, {})",
+        yolo_output.predictions.size(),
+        yolo_output.prototypes.size(),
+        yolo_output.transform.scale,
+        yolo_output.transform.pad_x,
+        yolo_output.transform.pad_y,
+    );
     let laser_path = path_generation::from_edge_mask(&images.laser_edges, &images.edge_colors);
     let laser = laser::EtherDreamStream::start(&laser_path);
     let video = Arc::new(Mutex::new(VideoBridgeState::default()));
-    let video_asset = app.asset_server().load("jcvd_green_screen_720p.mp4");
+    let (video_asset_name, video_label) = if app.assets_path().join(PREFERRED_VIDEO_ASSET).is_file()
+    {
+        (PREFERRED_VIDEO_ASSET, "JCVD green screen - 720p")
+    } else {
+        (FALLBACK_VIDEO_ASSET, "Big Buck Bunny - 720p")
+    };
+    let video_asset = app.asset_server().load(video_asset_name);
     app.command_scope({
         let video = video.clone();
         move |mut commands| {
@@ -109,6 +155,8 @@ fn model(app: &App) -> AppModel {
         laser_path,
         laser,
         video,
+        video_label,
+        _yolo: yolo,
     })
 }
 
@@ -167,8 +215,9 @@ fn process_video_frames(
             .detector
             .as_mut()
             .expect("detector was initialized");
+        let thresholds = lock_video(&bridge.0).thresholds;
         let frame_started = Instant::now();
-        match detector.process(&frame) {
+        match detector.process(&frame, thresholds.min, thresholds.max) {
             Ok(images) => {
                 let laser_path =
                     path_generation::from_edge_mask(&images.laser_edges, &images.edge_colors);
@@ -246,9 +295,6 @@ fn update_processed_frame(
         image::DynamicImage::ImageRgba8(images.original),
         image::DynamicImage::ImageLuma8(images.grayscale),
         image::DynamicImage::ImageLuma8(images.edges),
-        image::DynamicImage::ImageLuma8(images.thin_edges),
-        image::DynamicImage::ImageLuma8(images.edge_classes),
-        image::DynamicImage::ImageLuma8(images.connected_edges),
         image::DynamicImage::ImageLuma8(images.laser_edges),
         image::DynamicImage::ImageRgb8(images.edge_colors),
     ];
@@ -266,7 +312,7 @@ fn update_processed_frame(
 fn image_panels(
     images: edge_detection::EdgeDetectionImages,
     mut upload: impl FnMut(image::DynamicImage) -> Handle<Image>,
-) -> [ImagePanel; 8] {
+) -> [ImagePanel; 5] {
     [
         ImagePanel {
             label: "Original",
@@ -279,18 +325,6 @@ fn image_panels(
         ImagePanel {
             label: "Scharr magnitude",
             image: upload(image::DynamicImage::ImageLuma8(images.edges)),
-        },
-        ImagePanel {
-            label: "Non-maximum suppression",
-            image: upload(image::DynamicImage::ImageLuma8(images.thin_edges)),
-        },
-        ImagePanel {
-            label: "Threshold classes",
-            image: upload(image::DynamicImage::ImageLuma8(images.edge_classes)),
-        },
-        ImagePanel {
-            label: "Hysteresis",
-            image: upload(image::DynamicImage::ImageLuma8(images.connected_edges)),
         },
         ImagePanel {
             label: "Laser edge mask",
@@ -328,7 +362,41 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
             return;
         }
     };
-    let video = lock_video(&model.video);
+    let mut video = lock_video(&model.video);
+    let egui_context = app.egui();
+    let mut egui_viewport = egui::Ui::new(
+        egui_context.clone(),
+        "edge_threshold_viewport".into(),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(egui_context.viewport_rect()),
+    );
+    egui::Panel::left("edge_threshold_controls")
+        .exact_size(CONTROL_PANEL_WIDTH)
+        .resizable(false)
+        .show_inside(&mut egui_viewport, |ui| {
+            ui.heading("Edge thresholds");
+            ui.label("Normalized Scharr magnitude");
+            ui.add_space(8.0);
+
+            let mut min = video.thresholds.min;
+            let mut max = video.thresholds.max;
+            ui.add(
+                egui::Slider::new(&mut min, 0.0..=max)
+                    .text("Min")
+                    .fixed_decimals(3),
+            );
+            ui.add(
+                egui::Slider::new(&mut max, min..=1.0)
+                    .text("Max")
+                    .fixed_decimals(3),
+            );
+            video.thresholds = EdgeThresholds { min, max };
+
+            if ui.button("Reset").clicked() {
+                video.thresholds = EdgeThresholds::default();
+            }
+        });
     let processed = video.processed.as_ref();
     let panels = processed.map_or(&model.panels, |frame| &frame.panels);
     let laser_path = processed.map_or(&model.laser_path, |frame| &frame.laser_path);
@@ -338,7 +406,9 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
     let label_height = 30.0;
     let panel_count = panels.len() + 2;
     let row_count = panel_count.div_ceil(COLUMNS);
-    let cell_width = ((window.w() - margin * 2.0 - gap * 2.0) / COLUMNS as f32).max(1.0);
+    let content_width = (window.w() - CONTROL_PANEL_WIDTH).max(1.0);
+    let content_center_x = window.left() + CONTROL_PANEL_WIDTH + content_width * 0.5;
+    let cell_width = ((content_width - margin * 2.0 - gap * 2.0) / COLUMNS as f32).max(1.0);
     let cell_height = ((window.h() - margin * 2.0 - gap * row_count.saturating_sub(1) as f32)
         / row_count as f32)
         .max(1.0);
@@ -349,7 +419,7 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
         laser_path.point_count(),
         model.laser.status()
     );
-    let video_label = video.error.as_deref().unwrap_or("JCVD green screen - 720p");
+    let video_label = video.error.as_deref().unwrap_or(model.video_label);
 
     for index in 0..panel_count {
         let row = index / COLUMNS;
@@ -357,7 +427,9 @@ fn view(app: &App, model: &AppModel, _window: Entity) {
         let items_in_row = (panel_count - row * COLUMNS).min(COLUMNS);
         let row_width =
             items_in_row as f32 * cell_width + items_in_row.saturating_sub(1) as f32 * gap;
-        let x = -row_width * 0.5 + cell_width * 0.5 + column as f32 * (cell_width + gap);
+        let x = content_center_x - row_width * 0.5
+            + cell_width * 0.5
+            + column as f32 * (cell_width + gap);
         let cell_top = window.top() - margin - row as f32 * (cell_height + gap);
         let cell_y = cell_top - cell_height * 0.5;
         let image_y = cell_top - label_height - 8.0 - image_size * 0.5;

@@ -22,3 +22,5 @@ nannou_laser_cuda.*
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 assets/jcvd_green_screen_720p.mp4
+assets/yolo11n-seg.pt
+assets/yolo11n-seg.torchscript
