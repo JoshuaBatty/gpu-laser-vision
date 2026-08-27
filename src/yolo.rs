@@ -4,7 +4,7 @@
 //! input preparation, inference, person-mask decoding, and contour extraction.
 
 use anyhow::{Context, Result, bail};
-use image::{GrayImage, Luma, Rgb, RgbImage, RgbaImage, imageops};
+use image::{GrayImage, RgbImage, RgbaImage};
 use std::path::Path;
 use tch::{CModule, Device, IValue, Kind, Tensor};
 
@@ -22,6 +22,8 @@ pub struct YoloFrame {
     pub person_mask: GrayImage,
     /// One-pixel outline extracted from `person_mask`.
     pub contour: GrayImage,
+    /// Row-major indices of every non-zero pixel in `contour`.
+    pub contour_pixels: Vec<usize>,
     /// Source-frame colours retained only along `contour`.
     pub colored_contour: RgbImage,
     /// Confidence of the selected person detection, if one passed the threshold.
@@ -32,6 +34,8 @@ pub struct YoloFrame {
 pub struct YoloSegmenter {
     model: CModule,
     device: Device,
+    input: Tensor,
+    source_dimensions: Option<(u32, u32)>,
     confidence_threshold: f32,
 }
 
@@ -54,20 +58,40 @@ impl YoloSegmenter {
         let mut model = CModule::load_on_device(path, device)
             .with_context(|| format!("loading YOLO model from {}", path.display()))?;
         model.set_eval();
+        tch::Cuda::cudnn_set_benchmark(true);
+        let input = Tensor::full(
+            [1, 3, MODEL_IMAGE_SIZE as i64, MODEL_IMAGE_SIZE as i64],
+            114.0 / 255.0,
+            (Kind::Float, device),
+        );
 
         println!("YOLO inference device: {device:?}");
         Ok(Self {
             model,
             device,
+            input,
+            source_dimensions: None,
             confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
         })
     }
 
     /// Segments the strongest person detection and maps its mask to the source frame.
-    pub fn infer(&self, rgba: &RgbaImage) -> Result<YoloFrame> {
-        let (input, transform) = prepare_input(rgba, self.device)?;
-        let output = tch::no_grad(|| self.model.forward_is(&[IValue::Tensor(input)]))
-            .context("running YOLO TorchScript inference")?;
+    pub fn infer(&mut self, rgba: &RgbaImage) -> Result<YoloFrame> {
+        let dimensions = rgba.dimensions();
+        if self
+            .source_dimensions
+            .is_some_and(|previous| previous != dimensions)
+        {
+            let _ = self.input.fill_(114.0 / 255.0);
+        }
+        self.source_dimensions = Some(dimensions);
+
+        let transform = prepare_input(rgba, self.device, &self.input)?;
+        let output = tch::no_grad(|| {
+            self.model
+                .forward_is(&[IValue::Tensor(self.input.shallow_clone())])
+        })
+        .context("running YOLO TorchScript inference")?;
         let (predictions, prototypes) = segmentation_outputs(output)?;
 
         decode_person(
@@ -91,7 +115,15 @@ struct LetterboxTransform {
     pad_y: u32,
 }
 
-fn prepare_input(rgba: &RgbaImage, device: Device) -> Result<(Tensor, LetterboxTransform)> {
+#[derive(Clone, Copy)]
+struct MaskBounds {
+    left: usize,
+    right: usize,
+    top: usize,
+    bottom: usize,
+}
+
+fn prepare_input(rgba: &RgbaImage, device: Device, input: &Tensor) -> Result<LetterboxTransform> {
     let (source_width, source_height) = rgba.dimensions();
     anyhow::ensure!(
         source_width > 0 && source_height > 0,
@@ -105,38 +137,34 @@ fn prepare_input(rgba: &RgbaImage, device: Device) -> Result<(Tensor, LetterboxT
     let pad_x = (MODEL_IMAGE_SIZE - resized_width) / 2;
     let pad_y = (MODEL_IMAGE_SIZE - resized_height) / 2;
 
-    let rgb = image::DynamicImage::ImageRgba8(rgba.clone()).into_rgb8();
-    let resized = imageops::resize(
-        &rgb,
-        resized_width,
-        resized_height,
-        imageops::FilterType::Triangle,
-    );
-    let mut letterboxed =
-        RgbImage::from_pixel(MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE, Rgb([114, 114, 114]));
-    imageops::replace(&mut letterboxed, &resized, pad_x.into(), pad_y.into());
-
-    let input = Tensor::f_from_slice(letterboxed.as_raw())
+    let source = Tensor::f_from_slice(rgba.as_raw())
         .context("creating YOLO input tensor")?
-        .view([MODEL_IMAGE_SIZE as i64, MODEL_IMAGE_SIZE as i64, 3])
-        .permute([2, 0, 1])
-        .unsqueeze(0)
+        .view([1, source_height as i64, source_width as i64, 4])
         .to_device(device)
+        .narrow(3, 0, 3)
+        .permute([0, 3, 1, 2])
         .to_kind(Kind::Float)
         / 255.0;
+    let resized = source.upsample_bilinear2d(
+        [resized_height as i64, resized_width as i64],
+        false,
+        None,
+        None,
+    );
+    input
+        .narrow(2, pad_y as i64, resized_height as i64)
+        .narrow(3, pad_x as i64, resized_width as i64)
+        .copy_(&resized);
 
-    Ok((
-        input,
-        LetterboxTransform {
-            source_width,
-            source_height,
-            resized_width,
-            resized_height,
-            scale,
-            pad_x,
-            pad_y,
-        },
-    ))
+    Ok(LetterboxTransform {
+        source_width,
+        source_height,
+        resized_width,
+        resized_height,
+        scale,
+        pad_x,
+        pad_y,
+    })
 }
 
 fn segmentation_outputs(output: IValue) -> Result<(Tensor, Tensor)> {
@@ -182,8 +210,18 @@ fn decode_person(
 
     let predictions = predictions.get(0);
     let person_scores = predictions.get(4 + PERSON_CLASS_INDEX);
-    let candidate_index = person_scores.argmax(0, false).int64_value(&[]);
-    let confidence = person_scores.double_value(&[candidate_index]) as f32;
+    let candidate_index = person_scores.argmax(0, false).unsqueeze(0);
+    let detection = predictions.index_select(1, &candidate_index).squeeze_dim(1);
+    let metadata = detection
+        .narrow(0, 0, 5)
+        .to_device(Device::Cpu)
+        .to_kind(Kind::Float)
+        .contiguous();
+    let metadata = Vec::<f32>::try_from(&metadata).context("copying YOLO detection metadata")?;
+    let [center_x, center_y, box_width, box_height, confidence] = metadata.as_slice() else {
+        bail!("YOLO detection metadata has an unexpected length");
+    };
+    let confidence = *confidence;
     if !confidence.is_finite() || confidence < confidence_threshold {
         return Ok(empty_frame(transform));
     }
@@ -191,11 +229,6 @@ fn decode_person(
     // The exported segmentation head is [xywh, class scores, mask coefficients].
     // Selecting one strongest person keeps this first live visualization simple;
     // multi-person selection and NMS can be added when the product needs them.
-    let detection = predictions.select(1, candidate_index);
-    let center_x = detection.double_value(&[0]) as f32;
-    let center_y = detection.double_value(&[1]) as f32;
-    let box_width = detection.double_value(&[2]) as f32;
-    let box_height = detection.double_value(&[3]) as f32;
     let coefficients = detection.narrow(0, 4 + class_count, mask_channels);
     let prototype_logits = prototypes
         .get(0)
@@ -206,17 +239,18 @@ fn decode_person(
             .matmul(&prototype_logits)
             .view([1, 1, mask_height, mask_width]);
 
-    let person_mask = restore_mask(
+    let (person_mask, mask_bounds) = restore_mask(
         mask_logits,
-        [center_x, center_y, box_width, box_height],
+        [*center_x, *center_y, *box_width, *box_height],
         transform,
     )?;
-    let contour = extract_contour(&person_mask);
-    let colored_contour = colorize_contour(&contour, &person_mask, source);
+    let (contour, contour_pixels) = extract_contour(&person_mask, mask_bounds);
+    let colored_contour = colorize_contour(&contour_pixels, &person_mask, source);
 
     Ok(YoloFrame {
         person_mask,
         contour,
+        contour_pixels,
         colored_contour,
         confidence: Some(confidence),
     })
@@ -226,7 +260,7 @@ fn restore_mask(
     logits: Tensor,
     bounding_box: [f32; 4],
     transform: LetterboxTransform,
-) -> Result<GrayImage> {
+) -> Result<(GrayImage, MaskBounds)> {
     let model_mask = logits.upsample_bilinear2d(
         [MODEL_IMAGE_SIZE as i64, MODEL_IMAGE_SIZE as i64],
         false,
@@ -246,11 +280,11 @@ fn restore_mask(
             None,
             None,
         )
-        .to_device(Device::Cpu)
-        .to_kind(Kind::Float)
-        .contiguous()
-        .view([-1]);
-    let values = Vec::<f32>::try_from(&restored).context("copying YOLO mask to the CPU")?;
+        .gt(0.0)
+        .to_kind(Kind::Uint8)
+        * 255;
+    let restored = restored.to_device(Device::Cpu).contiguous().view([-1]);
+    let mut pixels = Vec::<u8>::try_from(&restored).context("copying YOLO mask to the CPU")?;
 
     let [center_x, center_y, width, height] = bounding_box;
     let left = ((center_x - width * 0.5 - transform.pad_x as f32) / transform.scale)
@@ -262,76 +296,99 @@ fn restore_mask(
     let bottom = ((center_y + height * 0.5 - transform.pad_y as f32) / transform.scale)
         .clamp(0.0, transform.source_height as f32);
 
-    let mut pixels = Vec::with_capacity(values.len());
-    for y in 0..transform.source_height {
-        for x in 0..transform.source_width {
-            let inside_box = (x as f32) >= left
-                && (x as f32) < right
-                && (y as f32) >= top
-                && (y as f32) < bottom;
-            let index = y as usize * transform.source_width as usize + x as usize;
-            pixels.push(u8::from(inside_box && values[index] > 0.0) * 255);
+    let width = transform.source_width as usize;
+    let left = left.ceil() as usize;
+    let right = right.ceil() as usize;
+    let top = top.ceil() as usize;
+    let bottom = bottom.ceil() as usize;
+    for (y, row) in pixels.chunks_exact_mut(width).enumerate() {
+        if y < top || y >= bottom {
+            row.fill(0);
+        } else {
+            row[..left].fill(0);
+            row[right..].fill(0);
         }
     }
 
-    GrayImage::from_raw(transform.source_width, transform.source_height, pixels)
-        .context("YOLO mask dimensions do not match its pixel buffer")
+    let mask = GrayImage::from_raw(transform.source_width, transform.source_height, pixels)
+        .context("YOLO mask dimensions do not match its pixel buffer")?;
+    Ok((
+        mask,
+        MaskBounds {
+            left,
+            right,
+            top,
+            bottom,
+        },
+    ))
 }
 
-fn extract_contour(mask: &GrayImage) -> GrayImage {
-    let (width, height) = mask.dimensions();
-    let mut contour = GrayImage::new(width, height);
+fn extract_contour(mask: &GrayImage, bounds: MaskBounds) -> (GrayImage, Vec<usize>) {
+    let width = mask.width() as usize;
+    let height = mask.height() as usize;
+    let source = mask.as_raw();
+    let mut contour = vec![0; source.len()];
+    let mut contour_pixels = Vec::new();
 
-    for y in 0..height {
-        for x in 0..width {
-            if mask.get_pixel(x, y)[0] == 0 {
-                continue;
-            }
-
-            let touches_background = x == 0
-                || y == 0
-                || x + 1 == width
-                || y + 1 == height
-                || mask.get_pixel(x - 1, y)[0] == 0
-                || mask.get_pixel(x + 1, y)[0] == 0
-                || mask.get_pixel(x, y - 1)[0] == 0
-                || mask.get_pixel(x, y + 1)[0] == 0;
-            if touches_background {
-                contour.put_pixel(x, y, Luma([255]));
+    for y in bounds.top..bounds.bottom {
+        for x in bounds.left..bounds.right {
+            let index = y * width + x;
+            if source[index] != 0
+                && (x == 0
+                    || y == 0
+                    || x + 1 == width
+                    || y + 1 == height
+                    || source[index - 1] == 0
+                    || source[index + 1] == 0
+                    || source[index - width] == 0
+                    || source[index + width] == 0)
+            {
+                contour[index] = 255;
+                contour_pixels.push(index);
             }
         }
     }
 
-    contour
+    (
+        GrayImage::from_raw(mask.width(), mask.height(), contour)
+            .expect("contour retains the source-mask dimensions"),
+        contour_pixels,
+    )
 }
 
-fn colorize_contour(contour: &GrayImage, person_mask: &GrayImage, source: &RgbaImage) -> RgbImage {
-    debug_assert_eq!(contour.dimensions(), source.dimensions());
+fn colorize_contour(
+    contour_pixels: &[usize],
+    person_mask: &GrayImage,
+    source: &RgbaImage,
+) -> RgbImage {
     debug_assert_eq!(person_mask.dimensions(), source.dimensions());
 
-    let mut colors = Vec::with_capacity(contour.as_raw().len() * 3);
-    for y in 0..contour.height() {
-        for x in 0..contour.width() {
-            if contour.get_pixel(x, y)[0] == 0 {
-                colors.extend_from_slice(&[0, 0, 0]);
-                continue;
-            }
-
-            colors.extend_from_slice(&foreground_color(x, y, person_mask, source));
-        }
+    let width = person_mask.width() as usize;
+    let height = person_mask.height() as usize;
+    let mut colors = vec![0; person_mask.as_raw().len() * 3];
+    for &index in contour_pixels {
+        let color = foreground_color(index, width, height, person_mask.as_raw(), source.as_raw());
+        colors[index * 3..index * 3 + 3].copy_from_slice(&color);
     }
 
-    RgbImage::from_raw(contour.width(), contour.height(), colors)
-        .expect("contour and source dimensions were checked")
+    RgbImage::from_raw(person_mask.width(), person_mask.height(), colors)
+        .expect("person mask determines the color buffer dimensions")
 }
 
-fn foreground_color(x: u32, y: u32, person_mask: &GrayImage, source: &RgbaImage) -> [u8; 3] {
-    let center = source.get_pixel(x, y).0;
-    let center = [center[0], center[1], center[2]];
+fn foreground_color(
+    index: usize,
+    width: usize,
+    height: usize,
+    person_mask: &[u8],
+    source: &[u8],
+) -> [u8; 3] {
+    let center = source_color(source, index);
     if !is_green_screen(center) {
         return center;
     }
 
+    let x = index % width;
+    let y = index / width;
     for radius in 1..=CONTOUR_COLOR_SEARCH_RADIUS {
         let mut best = None;
         for offset_y in -radius..=radius {
@@ -344,20 +401,18 @@ fn foreground_color(x: u32, y: u32, person_mask: &GrayImage, source: &RgbaImage)
                 let candidate_y = y as i32 + offset_y;
                 if candidate_x < 0
                     || candidate_y < 0
-                    || candidate_x >= source.width() as i32
-                    || candidate_y >= source.height() as i32
+                    || candidate_x >= width as i32
+                    || candidate_y >= height as i32
                 {
                     continue;
                 }
 
-                let candidate_x = candidate_x as u32;
-                let candidate_y = candidate_y as u32;
-                if person_mask.get_pixel(candidate_x, candidate_y)[0] == 0 {
+                let candidate = candidate_y as usize * width + candidate_x as usize;
+                if person_mask[candidate] == 0 {
                     continue;
                 }
 
-                let pixel = source.get_pixel(candidate_x, candidate_y).0;
-                let color = [pixel[0], pixel[1], pixel[2]];
+                let color = source_color(source, candidate);
                 if is_green_screen(color) {
                     continue;
                 }
@@ -377,6 +432,11 @@ fn foreground_color(x: u32, y: u32, person_mask: &GrayImage, source: &RgbaImage)
     [0, 0, 0]
 }
 
+fn source_color(source: &[u8], pixel: usize) -> [u8; 3] {
+    let offset = pixel * 4;
+    [source[offset], source[offset + 1], source[offset + 2]]
+}
+
 fn is_green_screen([red, green, blue]: [u8; 3]) -> bool {
     green >= 80 && green.saturating_sub(red.max(blue)) >= 35
 }
@@ -391,6 +451,7 @@ fn empty_frame(transform: LetterboxTransform) -> YoloFrame {
     YoloFrame {
         person_mask: GrayImage::new(transform.source_width, transform.source_height),
         contour: GrayImage::new(transform.source_width, transform.source_height),
+        contour_pixels: Vec::new(),
         colored_contour: RgbImage::new(transform.source_width, transform.source_height),
         confidence: None,
     }
@@ -405,7 +466,7 @@ fn tensor_output(value: IValue, name: &str) -> Result<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    use super::{colorize_contour, extract_contour};
+    use super::{MaskBounds, colorize_contour, extract_contour};
     use image::{GrayImage, Luma, Rgba, RgbaImage};
 
     #[test]
@@ -417,34 +478,39 @@ mod tests {
             }
         }
 
-        let contour = extract_contour(&mask);
+        let (contour, contour_pixels) = extract_contour(
+            &mask,
+            MaskBounds {
+                left: 0,
+                right: mask.width() as usize,
+                top: 0,
+                bottom: mask.height() as usize,
+            },
+        );
         assert_eq!(contour.get_pixel(2, 2)[0], 0);
         assert_eq!(contour.get_pixel(1, 1)[0], 255);
         assert_eq!(contour.get_pixel(3, 2)[0], 255);
         assert_eq!(contour.pixels().filter(|pixel| pixel[0] > 0).count(), 8);
+        assert_eq!(contour_pixels, [6, 7, 8, 11, 13, 16, 17, 18]);
     }
 
     #[test]
     fn colorized_contour_retains_source_colors_only_on_the_outline() {
-        let mut contour = GrayImage::new(2, 1);
-        contour.put_pixel(1, 0, Luma([255]));
         let source = RgbaImage::from_pixel(2, 1, Rgba([10, 20, 30, 255]));
 
         let person_mask = GrayImage::from_pixel(2, 1, Luma([255]));
-        let colors = colorize_contour(&contour, &person_mask, &source);
+        let colors = colorize_contour(&[1], &person_mask, &source);
         assert_eq!(colors.get_pixel(0, 0).0, [0, 0, 0]);
         assert_eq!(colors.get_pixel(1, 0).0, [10, 20, 30]);
     }
 
     #[test]
     fn colorized_contour_replaces_green_spill_with_nearby_foreground() {
-        let mut contour = GrayImage::new(3, 1);
-        contour.put_pixel(1, 0, Luma([255]));
         let person_mask = GrayImage::from_pixel(3, 1, Luma([255]));
         let mut source = RgbaImage::from_pixel(3, 1, Rgba([0, 180, 20, 255]));
         source.put_pixel(2, 0, Rgba([210, 90, 60, 255]));
 
-        let colors = colorize_contour(&contour, &person_mask, &source);
+        let colors = colorize_contour(&[1], &person_mask, &source);
         assert_eq!(colors.get_pixel(1, 0).0, [210, 90, 60]);
     }
 }
