@@ -132,6 +132,8 @@ impl DashboardLayout {
     }
 }
 
+// Card counts are small compile-time values, so their conversion is exact in practice.
+#[allow(clippy::cast_precision_loss)]
 fn row<const COUNT: usize>(
     left: f32,
     top: f32,

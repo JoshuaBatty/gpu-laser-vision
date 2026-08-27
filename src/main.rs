@@ -47,6 +47,7 @@ struct EdgeThresholds {
 }
 
 /// Timings for one frame, an accumulated window, or its averaged snapshot.
+#[allow(clippy::struct_field_names)]
 #[derive(Clone, Copy, Default)]
 struct PipelineTimingSample {
     frame_copy_ms: f64,
@@ -71,8 +72,8 @@ impl std::ops::AddAssign for PipelineTimingSample {
 }
 
 impl PipelineTimingSample {
-    fn averaged_over(self, frames: u64) -> Self {
-        let frames = frames.max(1) as f64;
+    fn averaged_over(self, frames: u32) -> Self {
+        let frames: f64 = frames.max(1).into();
         Self {
             frame_copy_ms: self.frame_copy_ms / frames,
             yolo_ms: self.yolo_ms / frames,
@@ -114,7 +115,7 @@ struct VideoBridgeState {
     error: Option<String>,
     window_sized: bool,
     fps_window_started: Option<Instant>,
-    processed_frames: u64,
+    processed_frames: u32,
     timing_totals: PipelineTimingSample,
     metrics: PipelineMetrics,
     interface_configured: bool,
@@ -211,9 +212,8 @@ fn process_video_frames(
             if !video.window_sized
                 && let Ok(mut window) = windows.single_mut()
             {
-                window
-                    .resolution
-                    .set(output.size.x as f32, output.size.y as f32);
+                let source_size = output.size.as_vec2();
+                window.resolution.set(source_size.x, source_size.y);
                 video.window_sized = true;
             }
         }
@@ -266,7 +266,7 @@ fn process_video_frames(
         if pipeline
             .detector
             .as_ref()
-            .map(|detector| detector.dimensions())
+            .map(edge_detection::CudaEdgeDetector::dimensions)
             != Some(dimensions)
         {
             match edge_detection::CudaEdgeDetector::new(dimensions.0, dimensions.1) {
@@ -285,113 +285,138 @@ fn process_video_frames(
             .expect("detector was initialized");
         let thresholds = lock_video(&bridge.0).thresholds;
         let cuda_edges_started = Instant::now();
-        let cuda_images = detector.process(frame, thresholds.min, thresholds.max);
+        let cuda_images = detector.process(&frame, thresholds.min, thresholds.max);
         let cuda_edges_ms = cuda_edges_started.elapsed().as_secs_f64() * 1_000.0;
         match cuda_images {
-            Ok(images) => {
-                let cuda_path_started = Instant::now();
-                let cuda_laser_path = path_generation::from_edge_mask(
-                    &images.laser_edges,
-                    &images.edge_colors,
-                    &images.edge_pixels,
-                );
-                let cuda_path_ms = cuda_path_started.elapsed().as_secs_f64() * 1_000.0;
-                let yolo_path_started = Instant::now();
-                let yolo_laser_path = path_generation::from_edge_mask(
-                    &yolo_frame.contour,
-                    &yolo_frame.colored_contour,
-                    &yolo_frame.contour_pixels,
-                );
-                let yolo_path_ms = yolo_path_started.elapsed().as_secs_f64() * 1_000.0;
-                // Publish one coherent frame before rolling the metrics window.
-                let mut video = lock_video(&bridge.0);
-                let cuda_point_count = cuda_laser_path.point_count();
-                let yolo_point_count = yolo_laser_path.point_count();
-                let debug_upload_started = Instant::now();
-                if let Some(processed) = &mut video.processed {
-                    update_processed_frame(
-                        processed,
-                        images,
-                        yolo_frame,
-                        cuda_laser_path,
-                        yolo_laser_path,
-                        &mut assets,
-                    );
-                } else {
-                    let panels = live_image_panels(images, yolo_frame, |image| {
-                        assets.add(Image::from_dynamic(
-                            image,
-                            true,
-                            RenderAssetUsages::default(),
-                        ))
-                    });
-                    video.processed = Some(ProcessedVideoFrame {
-                        panels,
-                        cuda_laser_path,
-                        yolo_laser_path,
-                    });
-                }
-                let debug_upload_ms = debug_upload_started.elapsed().as_secs_f64() * 1_000.0;
-                let total_ms = frame_started.elapsed().as_secs_f64() * 1_000.0;
-                video.timing_totals += PipelineTimingSample {
+            Ok(images) => publish_processed_frame(
+                &bridge.0,
+                &mut assets,
+                images,
+                yolo_frame,
+                yolo_confidence,
+                PipelineTimingSample {
                     frame_copy_ms,
                     yolo_ms,
                     cuda_edges_ms,
-                    cuda_path_ms,
-                    yolo_path_ms,
-                    debug_upload_ms,
-                    total_ms,
-                };
-                video.error = None;
-                if !video.reported_first_frame {
-                    let detection = yolo_confidence
-                        .map(|confidence| format!("person {confidence:.2}"))
-                        .unwrap_or_else(|| "no person".into());
-                    println!(
-                        "First frame: {:.1} ms ({yolo_ms:.1} ms YOLO, {detection}) | CUDA {cuda_point_count} points | YOLO {yolo_point_count} points",
-                        frame_started.elapsed().as_secs_f64() * 1_000.0,
-                    );
-                    video.reported_first_frame = true;
-                }
-                let now = Instant::now();
-                let started = *video.fps_window_started.get_or_insert(now);
-                video.processed_frames += 1;
-                let elapsed = now.duration_since(started).as_secs_f64();
-                if elapsed >= 2.0 {
-                    let detection = yolo_confidence
-                        .map(|confidence| format!("person {confidence:.2}"))
-                        .unwrap_or_else(|| "no person".into());
-                    println!(
-                        "Pipeline: {:.1} FPS | {yolo_ms:.1} ms YOLO ({detection}) | CUDA {cuda_point_count} points | YOLO {yolo_point_count} points",
-                        video.processed_frames as f64 / elapsed,
-                    );
-                    let average = video.timing_totals.averaged_over(video.processed_frames);
-                    let fps = video.processed_frames as f64 / elapsed;
-                    video.metrics = PipelineMetrics {
-                        fps,
-                        timings: average,
-                        yolo_confidence,
-                    };
-                    println!(
-                        "Stages: {:.1} total | {:.1} YOLO | {:.1} CUDA edges | {:.1} CUDA path | {:.1} YOLO path | {:.1} frame copy | {:.1} debug upload ms",
-                        average.total_ms,
-                        average.yolo_ms,
-                        average.cuda_edges_ms,
-                        average.cuda_path_ms,
-                        average.yolo_path_ms,
-                        average.frame_copy_ms,
-                        average.debug_upload_ms,
-                    );
-                    video.fps_window_started = Some(now);
-                    video.processed_frames = 0;
-                    video.timing_totals = PipelineTimingSample::default();
-                }
-            }
+                    ..PipelineTimingSample::default()
+                },
+                frame_started,
+            ),
             Err(error) => {
                 lock_video(&bridge.0).error = Some(format!("CUDA frame failed: {error:#}"));
             }
         }
     }
+}
+
+fn publish_processed_frame(
+    video: &Mutex<VideoBridgeState>,
+    assets: &mut Assets<Image>,
+    images: edge_detection::EdgeDetectionImages,
+    yolo_frame: yolo::YoloFrame,
+    yolo_confidence: Option<f32>,
+    mut timings: PipelineTimingSample,
+    frame_started: Instant,
+) {
+    let cuda_path_started = Instant::now();
+    let cuda_laser_path = path_generation::from_edge_mask(
+        &images.laser_edges,
+        &images.edge_colors,
+        &images.edge_pixels,
+    );
+    timings.cuda_path_ms = cuda_path_started.elapsed().as_secs_f64() * 1_000.0;
+
+    let yolo_path_started = Instant::now();
+    let yolo_laser_path = path_generation::from_edge_mask(
+        &yolo_frame.contour,
+        &yolo_frame.colored_contour,
+        &yolo_frame.contour_pixels,
+    );
+    timings.yolo_path_ms = yolo_path_started.elapsed().as_secs_f64() * 1_000.0;
+
+    // Publish one coherent frame before rolling the metrics window.
+    let mut video = lock_video(video);
+    let cuda_point_count = cuda_laser_path.point_count();
+    let yolo_point_count = yolo_laser_path.point_count();
+    let debug_upload_started = Instant::now();
+    if let Some(processed) = &mut video.processed {
+        update_processed_frame(
+            processed,
+            images,
+            yolo_frame,
+            cuda_laser_path,
+            yolo_laser_path,
+            assets,
+        );
+    } else {
+        let panels = live_image_panels(images, yolo_frame, |image| {
+            assets.add(Image::from_dynamic(
+                image,
+                true,
+                RenderAssetUsages::default(),
+            ))
+        });
+        video.processed = Some(ProcessedVideoFrame {
+            panels,
+            cuda_laser_path,
+            yolo_laser_path,
+        });
+    }
+    timings.debug_upload_ms = debug_upload_started.elapsed().as_secs_f64() * 1_000.0;
+    timings.total_ms = frame_started.elapsed().as_secs_f64() * 1_000.0;
+    video.timing_totals += timings;
+    video.error = None;
+
+    if !video.reported_first_frame {
+        let detection = detection_label(yolo_confidence);
+        println!(
+            "First frame: {:.1} ms ({:.1} ms YOLO, {detection}) | CUDA {cuda_point_count} points | YOLO {yolo_point_count} points",
+            timings.total_ms, timings.yolo_ms,
+        );
+        video.reported_first_frame = true;
+    }
+
+    let now = Instant::now();
+    let started = *video.fps_window_started.get_or_insert(now);
+    video.processed_frames += 1;
+    let elapsed = now.duration_since(started).as_secs_f64();
+    if elapsed < 2.0 {
+        return;
+    }
+
+    let processed_frames: f64 = video.processed_frames.into();
+    let detection = detection_label(yolo_confidence);
+    println!(
+        "Pipeline: {:.1} FPS | {:.1} ms YOLO ({detection}) | CUDA {cuda_point_count} points | YOLO {yolo_point_count} points",
+        processed_frames / elapsed,
+        timings.yolo_ms,
+    );
+    let average = video.timing_totals.averaged_over(video.processed_frames);
+    video.metrics = PipelineMetrics {
+        fps: processed_frames / elapsed,
+        timings: average,
+        yolo_confidence,
+    };
+    println!(
+        "Stages: {:.1} total | {:.1} YOLO | {:.1} CUDA edges | {:.1} CUDA path | {:.1} YOLO path | {:.1} frame copy | {:.1} debug upload ms",
+        average.total_ms,
+        average.yolo_ms,
+        average.cuda_edges_ms,
+        average.cuda_path_ms,
+        average.yolo_path_ms,
+        average.frame_copy_ms,
+        average.debug_upload_ms,
+    );
+    video.fps_window_started = Some(now);
+    video.processed_frames = 0;
+    video.timing_totals = PipelineTimingSample::default();
+}
+
+fn detection_label(confidence: Option<f32>) -> String {
+    confidence.map_or_else(
+        || "no person".into(),
+        |confidence| format!("person {confidence:.2}"),
+    )
 }
 
 fn update_processed_frame(
@@ -493,7 +518,7 @@ fn live_image_panels(
 fn lock_video(video: &Mutex<VideoBridgeState>) -> MutexGuard<'_, VideoBridgeState> {
     video
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn view(app: &App, model: &AppModel, window_entity: Entity) {
@@ -548,6 +573,15 @@ fn view(app: &App, model: &AppModel, window_entity: Entity) {
         });
 
     let layout = interface::DashboardLayout::new(window);
+    draw_source_card(&draw, layout.hero[0], &video);
+    if let Some(frame) = video.processed.as_ref() {
+        draw_processed_dashboard(&draw, &layout, video.metrics, frame);
+    } else {
+        draw_loading_dashboard(&draw, &layout, &model.cuda_laser_path);
+    }
+}
+
+fn draw_source_card(draw: &Draw, card: interface::CardRect, video: &VideoBridgeState) {
     let source_meta = if video.error.is_some() {
         "SOURCE ERROR"
     } else if video.image.is_some() {
@@ -556,8 +590,8 @@ fn view(app: &App, model: &AppModel, window_entity: Entity) {
         "CONNECTING"
     };
     let source_media = interface::draw_card_shell(
-        &draw,
-        layout.hero[0],
+        draw,
+        card,
         "SOURCE",
         "INPUT VIDEO",
         source_meta,
@@ -568,99 +602,101 @@ fn view(app: &App, model: &AppModel, window_entity: Entity) {
         },
     );
     if let Some(image) = &video.image {
-        interface::draw_texture(&draw, image, source_media);
+        interface::draw_texture(draw, image, source_media);
     } else {
-        interface::draw_empty_state(&draw, source_media, "WAITING FOR VIDEO");
+        interface::draw_empty_state(draw, source_media, "WAITING FOR VIDEO");
     }
+}
 
-    if let Some(frame) = video.processed.as_ref() {
-        let [
-            cuda_contour,
-            yolo_contour,
+fn draw_processed_dashboard(
+    draw: &Draw,
+    layout: &interface::DashboardLayout,
+    metrics: PipelineMetrics,
+    frame: &ProcessedVideoFrame,
+) {
+    let [
+        cuda_contour,
+        yolo_contour,
+        yolo_mask,
+        grayscale,
+        scharr,
+        cuda_mask,
+    ] = &frame.panels;
+
+    let cuda_contour_media = interface::draw_card_shell(
+        draw,
+        layout.hero[1],
+        "CUDA",
+        "COLORED CONTOUR",
+        &format!("{} PTS", frame.cuda_laser_path.point_count()),
+        interface::Accent::Cuda,
+    );
+    interface::draw_texture(draw, &cuda_contour.image, cuda_contour_media);
+
+    let confidence = metrics.yolo_confidence.map_or_else(
+        || "SEARCHING".into(),
+        |value| format!("{:.0}% PERSON", value * 100.0),
+    );
+    let yolo_contour_media = interface::draw_card_shell(
+        draw,
+        layout.hero[2],
+        "YOLO",
+        "COLORED CONTOUR",
+        &confidence,
+        interface::Accent::Yolo,
+    );
+    interface::draw_texture(draw, &yolo_contour.image, yolo_contour_media);
+
+    let cuda_laser_meta = format!(
+        "{} LINES · {} PTS",
+        frame.cuda_laser_path.laser_lines().len(),
+        frame.cuda_laser_path.point_count()
+    );
+    let cuda_laser_media = interface::draw_card_shell(
+        draw,
+        layout.outputs[0],
+        "CUDA OUTPUT",
+        "LASER PREVIEW",
+        &cuda_laser_meta,
+        interface::Accent::Cuda,
+    );
+    draw_laser_path(draw, &frame.cuda_laser_path, cuda_laser_media);
+
+    let yolo_laser_meta = format!(
+        "{} LINES · {} PTS",
+        frame.yolo_laser_path.laser_lines().len(),
+        frame.yolo_laser_path.point_count()
+    );
+    let yolo_laser_media = interface::draw_card_shell(
+        draw,
+        layout.outputs[1],
+        "YOLO OUTPUT",
+        "LASER PREVIEW",
+        &yolo_laser_meta,
+        interface::Accent::Yolo,
+    );
+    draw_laser_path(draw, &frame.yolo_laser_path, yolo_laser_media);
+
+    for (card, eyebrow, title, panel) in [
+        (layout.diagnostics[0], "CUDA STAGE", "GRAYSCALE", grayscale),
+        (layout.diagnostics[1], "CUDA STAGE", "SCHARR", scharr),
+        (layout.diagnostics[2], "CUDA STAGE", "EDGE MASK", cuda_mask),
+        (
+            layout.diagnostics[3],
+            "YOLO STAGE",
+            "PERSON MASK",
             yolo_mask,
-            grayscale,
-            scharr,
-            cuda_mask,
-        ] = &frame.panels;
-
-        let cuda_contour_media = interface::draw_card_shell(
-            &draw,
-            layout.hero[1],
-            "CUDA",
-            "COLORED CONTOUR",
-            &format!("{} PTS", frame.cuda_laser_path.point_count()),
-            interface::Accent::Cuda,
+        ),
+    ] {
+        let media = interface::draw_card_shell(
+            draw,
+            card,
+            eyebrow,
+            title,
+            "",
+            interface::Accent::Diagnostic,
         );
-        interface::draw_texture(&draw, &cuda_contour.image, cuda_contour_media);
-
-        let confidence = video
-            .metrics
-            .yolo_confidence
-            .map(|value| format!("{:.0}% PERSON", value * 100.0))
-            .unwrap_or_else(|| "SEARCHING".into());
-        let yolo_contour_media = interface::draw_card_shell(
-            &draw,
-            layout.hero[2],
-            "YOLO",
-            "COLORED CONTOUR",
-            &confidence,
-            interface::Accent::Yolo,
-        );
-        interface::draw_texture(&draw, &yolo_contour.image, yolo_contour_media);
-
-        let cuda_laser_meta = format!(
-            "{} LINES · {} PTS",
-            frame.cuda_laser_path.laser_lines().len(),
-            frame.cuda_laser_path.point_count()
-        );
-        let cuda_laser_media = interface::draw_card_shell(
-            &draw,
-            layout.outputs[0],
-            "CUDA OUTPUT",
-            "LASER PREVIEW",
-            &cuda_laser_meta,
-            interface::Accent::Cuda,
-        );
-        draw_laser_path(&draw, &frame.cuda_laser_path, cuda_laser_media);
-
-        let yolo_laser_meta = format!(
-            "{} LINES · {} PTS",
-            frame.yolo_laser_path.laser_lines().len(),
-            frame.yolo_laser_path.point_count()
-        );
-        let yolo_laser_media = interface::draw_card_shell(
-            &draw,
-            layout.outputs[1],
-            "YOLO OUTPUT",
-            "LASER PREVIEW",
-            &yolo_laser_meta,
-            interface::Accent::Yolo,
-        );
-        draw_laser_path(&draw, &frame.yolo_laser_path, yolo_laser_media);
-
-        for (card, eyebrow, title, panel) in [
-            (layout.diagnostics[0], "CUDA STAGE", "GRAYSCALE", grayscale),
-            (layout.diagnostics[1], "CUDA STAGE", "SCHARR", scharr),
-            (layout.diagnostics[2], "CUDA STAGE", "EDGE MASK", cuda_mask),
-            (
-                layout.diagnostics[3],
-                "YOLO STAGE",
-                "PERSON MASK",
-                yolo_mask,
-            ),
-        ] {
-            let media = interface::draw_card_shell(
-                &draw,
-                card,
-                eyebrow,
-                title,
-                "",
-                interface::Accent::Diagnostic,
-            );
-            interface::draw_texture(&draw, &panel.image, media);
-        }
-    } else {
-        draw_loading_dashboard(&draw, &layout, &model.cuda_laser_path);
+        interface::draw_texture(draw, &panel.image, media);
     }
 }
 
@@ -688,10 +724,10 @@ fn draw_header(
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             interface::status_chip(ui, "LASER", laser_status, laser_accent);
-            let yolo = metrics
-                .yolo_confidence
-                .map(|value| format!("{:.0}%", value * 100.0))
-                .unwrap_or_else(|| "WARMING".into());
+            let yolo = metrics.yolo_confidence.map_or_else(
+                || "WARMING".into(),
+                |value| format!("{:.0}%", value * 100.0),
+            );
             interface::status_chip(ui, "YOLO", &yolo, interface::Accent::Yolo);
             interface::status_chip(ui, "CUDA", "GRAPH", interface::Accent::Cuda);
             let fps = if metrics.fps > 0.0 {
@@ -710,41 +746,7 @@ fn draw_control_rail(
     video_label: &str,
     laser_status: &str,
 ) {
-    ui.spacing_mut().item_spacing.y = 4.0;
-    interface::section_label(ui, "VISION CONTROLS");
-    ui.add_space(3.0);
-    ui.label(egui::RichText::new("Edge thresholds").size(16.0).strong());
-    ui.label(
-        egui::RichText::new("Normalized Scharr magnitude")
-            .size(11.0)
-            .color(egui::Color32::from_rgb(121, 134, 144)),
-    );
-    ui.add_space(8.0);
-
-    let mut min = video.thresholds.min;
-    let mut max = video.thresholds.max;
-    interface::metric_row(
-        ui,
-        "MIN THRESHOLD",
-        egui::RichText::new(format!("{min:.3}"))
-            .strong()
-            .color(interface::Accent::Cuda.ui_color()),
-    );
-    ui.add(egui::Slider::new(&mut min, 0.0..=max).show_value(false));
-    interface::metric_row(
-        ui,
-        "MAX THRESHOLD",
-        egui::RichText::new(format!("{max:.3}"))
-            .strong()
-            .color(interface::Accent::Cuda.ui_color()),
-    );
-    ui.add(egui::Slider::new(&mut max, min..=1.0).show_value(false));
-    video.thresholds = EdgeThresholds { min, max };
-
-    ui.add_space(4.0);
-    if ui.button("Reset thresholds").clicked() {
-        video.thresholds = EdgeThresholds::default();
-    }
+    draw_threshold_controls(ui, &mut video.thresholds);
 
     ui.add_space(16.0);
     ui.separator();
@@ -816,6 +818,44 @@ fn draw_control_rail(
                 .size(10.0)
                 .color(interface::Accent::Error.ui_color()),
         );
+    }
+}
+
+fn draw_threshold_controls(ui: &mut egui::Ui, thresholds: &mut EdgeThresholds) {
+    ui.spacing_mut().item_spacing.y = 4.0;
+    interface::section_label(ui, "VISION CONTROLS");
+    ui.add_space(3.0);
+    ui.label(egui::RichText::new("Edge thresholds").size(16.0).strong());
+    ui.label(
+        egui::RichText::new("Normalized Scharr magnitude")
+            .size(11.0)
+            .color(egui::Color32::from_rgb(121, 134, 144)),
+    );
+    ui.add_space(8.0);
+
+    let mut min = thresholds.min;
+    let mut max = thresholds.max;
+    interface::metric_row(
+        ui,
+        "MIN THRESHOLD",
+        egui::RichText::new(format!("{min:.3}"))
+            .strong()
+            .color(interface::Accent::Cuda.ui_color()),
+    );
+    ui.add(egui::Slider::new(&mut min, 0.0..=max).show_value(false));
+    interface::metric_row(
+        ui,
+        "MAX THRESHOLD",
+        egui::RichText::new(format!("{max:.3}"))
+            .strong()
+            .color(interface::Accent::Cuda.ui_color()),
+    );
+    ui.add(egui::Slider::new(&mut max, min..=1.0).show_value(false));
+    *thresholds = EdgeThresholds { min, max };
+
+    ui.add_space(4.0);
+    if ui.button("Reset thresholds").clicked() {
+        *thresholds = EdgeThresholds::default();
     }
 }
 

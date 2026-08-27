@@ -3,21 +3,25 @@
 use cuda_device::{DisjointSlice, cuda_module, kernel};
 pub use device::*;
 
+// `#[kernel]` supplies the CUDA entry-point linkage expected by the code generator.
+#[allow(clippy::no_mangle_with_rust_abi)]
 #[cuda_module]
 mod device {
-    use super::*;
+    use core::cmp::Ordering;
+
+    use super::{DisjointSlice, kernel};
 
     const COLOR_SAMPLE_DISTANCE: usize = 2;
 
     /// Converts packed row-major RGBA pixels to normalized luminance.
     #[kernel]
-    pub fn convert_to_grayscale(rgba: &[u8], mut b: DisjointSlice<f32>) {
-        if let Some((b_elem, idx)) = b.get_mut_indexed() {
+    pub fn convert_to_grayscale(rgba: &[u8], mut grayscale: DisjointSlice<f32>) {
+        if let Some((output, idx)) = grayscale.get_mut_indexed() {
             let source = idx.get() * 4;
-            let red = rgba[source] as f32 / 255.0;
-            let green = rgba[source + 1] as f32 / 255.0;
-            let blue = rgba[source + 2] as f32 / 255.0;
-            *b_elem = 0.299 * red + 0.587 * green + 0.114 * blue;
+            let red = f32::from(rgba[source]) / 255.0;
+            let green = f32::from(rgba[source + 1]) / 255.0;
+            let blue = f32::from(rgba[source + 2]) / 255.0;
+            *output = 0.299 * red + 0.587 * green + 0.114 * blue;
         }
     }
 
@@ -25,23 +29,23 @@ mod device {
     #[kernel]
     pub fn scharr(
         gray: &[f32],
-        mut b: DisjointSlice<f32>,
+        mut magnitude: DisjointSlice<f32>,
         mut grad_x: DisjointSlice<f32>,
         mut grad_y: DisjointSlice<f32>,
-        w: usize,
-        h: usize,
+        width: usize,
+        height: usize,
     ) {
         if let (Some((edge, idx)), Some((grad_x_out, _)), Some((grad_y_out, _))) = (
-            b.get_mut_indexed(),
+            magnitude.get_mut_indexed(),
             grad_x.get_mut_indexed(),
             grad_y.get_mut_indexed(),
         ) {
-            let i = idx.get();
-            let x = i % w;
-            let y = i / w;
+            let index = idx.get();
+            let x = index % width;
+            let y = index / width;
 
             // Give border pixels no edge value.
-            if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
+            if x == 0 || y == 0 || x + 1 == width || y + 1 == height {
                 *edge = 0.0;
                 *grad_x_out = 0.0;
                 *grad_y_out = 0.0;
@@ -49,14 +53,14 @@ mod device {
             }
 
             // Read the eight neighbouring grayscale pixels.
-            let top_left = gray[i - w - 1];
-            let top = gray[i - w];
-            let top_right = gray[i - w + 1];
-            let left = gray[i - 1];
-            let right = gray[i + 1];
-            let bottom_left = gray[i + w - 1];
-            let bottom = gray[i + w];
-            let bottom_right = gray[i + w + 1];
+            let top_left = gray[index - width - 1];
+            let top = gray[index - width];
+            let top_right = gray[index - width + 1];
+            let left = gray[index - 1];
+            let right = gray[index + 1];
+            let bottom_left = gray[index + width - 1];
+            let bottom = gray[index + width];
+            let bottom_right = gray[index + width + 1];
 
             // Scharr horizontal and vertical gradients.
             let gx = (-3.0 * top_left + 3.0 * top_right - 10.0 * left + 10.0 * right
@@ -80,6 +84,7 @@ mod device {
     }
 
     /// Converts a normalized floating-point stage into display-ready bytes on the GPU.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     #[kernel]
     pub fn normalized_f32_to_u8(input: &[f32], mut output: DisjointSlice<u8>) {
         if let Some((output, idx)) = output.get_mut_indexed() {
@@ -95,48 +100,48 @@ mod device {
         grad_x: &[f32],
         grad_y: &[f32],
         mut edge_colors: DisjointSlice<u32>,
-        w: usize,
+        width: usize,
         thresholds: &[f32],
     ) {
         if let Some((edge_color, idx)) = edge_colors.get_mut_indexed() {
-            let i = idx.get();
-            let gx = grad_x[i];
-            let gy = grad_y[i];
-            let strength = edges[i];
+            let index = idx.get();
+            let gradient_x = grad_x[index];
+            let gradient_y = grad_y[index];
+            let strength = edges[index];
             if strength < thresholds[0] || strength > thresholds[1] {
                 *edge_color = 0;
                 return;
             }
 
-            let x = i % w;
-            let y = i / w;
-            let h = rgba.len() / 4 / w;
+            let x = index % width;
+            let y = index / width;
+            let height = rgba.len() / 4 / width;
 
             // Quantize the gradient normal to horizontal, vertical, or diagonal.
-            let (dx, dy): (isize, isize) = if gx.abs() >= gy.abs() {
-                if gy.abs() * 2.0 <= gx.abs() {
+            let (dx, dy): (isize, isize) = if gradient_x.abs() >= gradient_y.abs() {
+                if gradient_y.abs() * 2.0 <= gradient_x.abs() {
                     (1, 0)
-                } else if gx * gy >= 0.0 {
+                } else if gradient_x * gradient_y >= 0.0 {
                     (1, 1)
                 } else {
                     (1, -1)
                 }
-            } else if gx.abs() * 2.0 <= gy.abs() {
+            } else if gradient_x.abs() * 2.0 <= gradient_y.abs() {
                 (0, 1)
-            } else if gx * gy >= 0.0 {
+            } else if gradient_x * gradient_y >= 0.0 {
                 (1, 1)
             } else {
                 (1, -1)
             };
 
-            let plus_x = offset_coordinate(x, dx, COLOR_SAMPLE_DISTANCE, w);
-            let plus_y = offset_coordinate(y, dy, COLOR_SAMPLE_DISTANCE, h);
-            let minus_x = offset_coordinate(x, -dx, COLOR_SAMPLE_DISTANCE, w);
-            let minus_y = offset_coordinate(y, -dy, COLOR_SAMPLE_DISTANCE, h);
+            let plus_x = offset_coordinate(x, dx, COLOR_SAMPLE_DISTANCE, width);
+            let plus_y = offset_coordinate(y, dy, COLOR_SAMPLE_DISTANCE, height);
+            let minus_x = offset_coordinate(x, -dx, COLOR_SAMPLE_DISTANCE, width);
+            let minus_y = offset_coordinate(y, -dy, COLOR_SAMPLE_DISTANCE, height);
 
-            let center = i;
-            let plus = plus_y * w + plus_x;
-            let minus = minus_y * w + minus_x;
+            let center = index;
+            let plus = plus_y * width + plus_x;
+            let minus = minus_y * width + minus_x;
             let mut selected = center;
             let mut selected_score = color_score(rgba, center);
             let plus_score = color_score(rgba, plus);
@@ -149,9 +154,9 @@ mod device {
             }
 
             let source = selected * 4;
-            *edge_color = rgba[source] as u32
-                | (rgba[source + 1] as u32) << 8
-                | (rgba[source + 2] as u32) << 16
+            *edge_color = u32::from(rgba[source])
+                | u32::from(rgba[source + 1]) << 8
+                | u32::from(rgba[source + 2]) << 16
                 | 0xff << 24;
         }
     }
@@ -162,12 +167,10 @@ mod device {
         distance: usize,
         limit: usize,
     ) -> usize {
-        if direction < 0 {
-            coordinate.saturating_sub(distance)
-        } else if direction > 0 {
-            (coordinate + distance).min(limit - 1)
-        } else {
-            coordinate
+        match direction.cmp(&0) {
+            Ordering::Less => coordinate.saturating_sub(distance),
+            Ordering::Equal => coordinate,
+            Ordering::Greater => (coordinate + distance).min(limit - 1),
         }
     }
 
@@ -178,6 +181,6 @@ mod device {
         let blue = rgba[source + 2];
         let brightest = red.max(green).max(blue);
         let darkest = red.min(green).min(blue);
-        brightest as u16 * 2 + (brightest - darkest) as u16
+        u16::from(brightest) * 2 + u16::from(brightest - darkest)
     }
 }

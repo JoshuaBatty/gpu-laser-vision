@@ -77,11 +77,11 @@ pub fn process(path: impl AsRef<Path>) -> Result<EdgeDetectionImages> {
         .decode()?
         .into_rgba8();
 
-    process_rgba(rgba)
+    process_rgba(&rgba)
 }
 
 /// Runs the GPU edge-detection pipeline on an in-memory RGBA image.
-pub fn process_rgba(rgba: RgbaImage) -> Result<EdgeDetectionImages> {
+pub fn process_rgba(rgba: &RgbaImage) -> Result<EdgeDetectionImages> {
     let mut detector = CudaEdgeDetector::new(rgba.width(), rgba.height())?;
     detector.process(rgba, DEFAULT_MIN_THRESHOLD, DEFAULT_MAX_THRESHOLD)
 }
@@ -89,10 +89,13 @@ pub fn process_rgba(rgba: RgbaImage) -> Result<EdgeDetectionImages> {
 impl CudaEdgeDetector {
     /// Allocates frame-sized resources and captures the CUDA graph.
     pub fn new(width: u32, height: u32) -> Result<Self> {
+        anyhow::ensure!(width > 0 && height > 0, "frame dimensions must be non-zero");
+        let element_count = width
+            .checked_mul(height)
+            .context("frame contains more pixels than a CUDA launch can address")?;
         let w = width as usize;
         let h = height as usize;
-        let n = w * h;
-        anyhow::ensure!(width > 0 && height > 0, "frame dimensions must be non-zero");
+        let n = element_count as usize;
 
         // Initialize CUDA once for every sequence of equally sized frames.
         let context = CudaContext::new(0)?;
@@ -120,7 +123,7 @@ impl CudaEdgeDetector {
             unsafe {
                 resources.module.convert_to_grayscale(
                     &resources.stream,
-                    LaunchConfig::for_num_elems(n as u32),
+                    LaunchConfig::for_num_elems(element_count),
                     &resources.input_rgba,
                     &mut resources.grayscale,
                 )
@@ -130,7 +133,7 @@ impl CudaEdgeDetector {
             unsafe {
                 resources.module.scharr(
                     &resources.stream,
-                    LaunchConfig::for_num_elems(n as u32),
+                    LaunchConfig::for_num_elems(element_count),
                     &resources.grayscale,
                     &mut resources.scharr_magnitude,
                     &mut resources.gradient_x,
@@ -144,7 +147,7 @@ impl CudaEdgeDetector {
             unsafe {
                 resources.module.extract_laser_edges(
                     &resources.stream,
-                    LaunchConfig::for_num_elems(n as u32),
+                    LaunchConfig::for_num_elems(element_count),
                     &resources.input_rgba,
                     &resources.scharr_magnitude,
                     &resources.gradient_x,
@@ -159,7 +162,7 @@ impl CudaEdgeDetector {
             unsafe {
                 resources.module.normalized_f32_to_u8(
                     &resources.stream,
-                    LaunchConfig::for_num_elems(n as u32),
+                    LaunchConfig::for_num_elems(element_count),
                     &resources.grayscale,
                     &mut resources.grayscale_preview,
                 )
@@ -169,7 +172,7 @@ impl CudaEdgeDetector {
             unsafe {
                 resources.module.normalized_f32_to_u8(
                     &resources.stream,
-                    LaunchConfig::for_num_elems(n as u32),
+                    LaunchConfig::for_num_elems(element_count),
                     &resources.scharr_magnitude,
                     &mut resources.scharr_preview,
                 )
@@ -195,7 +198,7 @@ impl CudaEdgeDetector {
     /// Processes one frame and copies the retained outputs back to the host.
     pub fn process(
         &mut self,
-        rgba: RgbaImage,
+        rgba: &RgbaImage,
         min_threshold: f32,
         max_threshold: f32,
     ) -> Result<EdgeDetectionImages> {

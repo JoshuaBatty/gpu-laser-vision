@@ -1,6 +1,6 @@
 //! PyTorch-backed YOLO instance-segmentation inference.
 //!
-//! This module owns the TorchScript model and the complete neural-vision path:
+//! This module owns the `TorchScript` model and the complete neural-vision path:
 //! input preparation, inference, person-mask decoding, and contour extraction.
 
 use anyhow::{Context, Result, bail};
@@ -11,9 +11,9 @@ use tch::{CModule, Device, IValue, Kind, Tensor};
 const MODEL_IMAGE_SIZE: u32 = 640;
 const PERSON_CLASS_INDEX: i64 = 0;
 const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.25;
-const CONTOUR_COLOR_SEARCH_RADIUS: i32 = 8;
+const CONTOUR_COLOR_SEARCH_RADIUS: isize = 8;
 
-/// Default TorchScript artifact produced by `scripts/export_yolo.py`.
+/// Default `TorchScript` artifact produced by `scripts/export_yolo.py`.
 pub const DEFAULT_MODEL_PATH: &str = "assets/yolo11n-seg.torchscript";
 
 /// Display-ready result from one YOLO segmentation pass.
@@ -30,7 +30,7 @@ pub struct YoloFrame {
     pub confidence: Option<f32>,
 }
 
-/// Loaded YOLO TorchScript model and its inference device.
+/// Loaded YOLO `TorchScript` model and its inference device.
 pub struct YoloSegmenter {
     model: CModule,
     device: Device,
@@ -40,7 +40,7 @@ pub struct YoloSegmenter {
 }
 
 impl YoloSegmenter {
-    /// Loads a TorchScript segmentation model onto the first CUDA device.
+    /// Loads a `TorchScript` segmentation model onto the first CUDA device.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if !path.is_file() {
@@ -60,7 +60,12 @@ impl YoloSegmenter {
         model.set_eval();
         tch::Cuda::cudnn_set_benchmark(true);
         let input = Tensor::full(
-            [1, 3, MODEL_IMAGE_SIZE as i64, MODEL_IMAGE_SIZE as i64],
+            [
+                1,
+                3,
+                i64::from(MODEL_IMAGE_SIZE),
+                i64::from(MODEL_IMAGE_SIZE),
+            ],
             114.0 / 255.0,
             (Kind::Float, device),
         );
@@ -96,8 +101,8 @@ impl YoloSegmenter {
         let (predictions, prototypes) = segmentation_outputs(output)?;
 
         decode_person(
-            predictions,
-            prototypes,
+            &predictions,
+            &prototypes,
             transform,
             self.confidence_threshold,
             rgba,
@@ -126,6 +131,12 @@ struct MaskBounds {
     bottom: usize,
 }
 
+// Letterboxing intentionally rounds between source pixels and model coordinates.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn prepare_input(rgba: &RgbaImage, device: Device, input: &Tensor) -> Result<LetterboxTransform> {
     let (source_width, source_height) = rgba.dimensions();
     anyhow::ensure!(
@@ -142,21 +153,21 @@ fn prepare_input(rgba: &RgbaImage, device: Device, input: &Tensor) -> Result<Let
 
     let source = Tensor::f_from_slice(rgba.as_raw())
         .context("creating YOLO input tensor")?
-        .view([1, source_height as i64, source_width as i64, 4])
+        .view([1, i64::from(source_height), i64::from(source_width), 4])
         .to_device(device)
         .narrow(3, 0, 3)
         .permute([0, 3, 1, 2])
         .to_kind(Kind::Float)
         / 255.0;
     let resized = source.upsample_bilinear2d(
-        [resized_height as i64, resized_width as i64],
+        [i64::from(resized_height), i64::from(resized_width)],
         false,
         None,
         None,
     );
     input
-        .narrow(2, pad_y as i64, resized_height as i64)
-        .narrow(3, pad_x as i64, resized_width as i64)
+        .narrow(2, i64::from(pad_y), i64::from(resized_height))
+        .narrow(3, i64::from(pad_x), i64::from(resized_width))
         .copy_(&resized);
 
     Ok(LetterboxTransform {
@@ -187,8 +198,8 @@ fn segmentation_outputs(output: IValue) -> Result<(Tensor, Tensor)> {
 }
 
 fn decode_person(
-    predictions: Tensor,
-    prototypes: Tensor,
+    predictions: &Tensor,
+    prototypes: &Tensor,
     transform: LetterboxTransform,
     confidence_threshold: f32,
     source: &RgbaImage,
@@ -243,7 +254,7 @@ fn decode_person(
             .view([1, 1, mask_height, mask_width]);
 
     let (person_mask, mask_bounds) = restore_mask(
-        mask_logits,
+        &mask_logits,
         [*center_x, *center_y, *box_width, *box_height],
         transform,
     )?;
@@ -259,25 +270,39 @@ fn decode_person(
     })
 }
 
+// Model-space boxes are clamped before conversion back to source pixel indices.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn restore_mask(
-    logits: Tensor,
+    logits: &Tensor,
     bounding_box: [f32; 4],
     transform: LetterboxTransform,
 ) -> Result<(GrayImage, MaskBounds)> {
     let model_mask = logits.upsample_bilinear2d(
-        [MODEL_IMAGE_SIZE as i64, MODEL_IMAGE_SIZE as i64],
+        [i64::from(MODEL_IMAGE_SIZE), i64::from(MODEL_IMAGE_SIZE)],
         false,
         None,
         None,
     );
     let unpadded = model_mask
-        .narrow(2, transform.pad_y as i64, transform.resized_height as i64)
-        .narrow(3, transform.pad_x as i64, transform.resized_width as i64);
+        .narrow(
+            2,
+            i64::from(transform.pad_y),
+            i64::from(transform.resized_height),
+        )
+        .narrow(
+            3,
+            i64::from(transform.pad_x),
+            i64::from(transform.resized_width),
+        );
     let restored = unpadded
         .upsample_bilinear2d(
             [
-                transform.source_height as i64,
-                transform.source_width as i64,
+                i64::from(transform.source_height),
+                i64::from(transform.source_width),
             ],
             false,
             None,
@@ -390,8 +415,10 @@ fn foreground_color(
         return center;
     }
 
-    let x = index % width;
-    let y = index / width;
+    let x = isize::try_from(index % width).expect("image coordinates fit in isize");
+    let y = isize::try_from(index / width).expect("image coordinates fit in isize");
+    let signed_width = isize::try_from(width).expect("image width fits in isize");
+    let signed_height = isize::try_from(height).expect("image height fits in isize");
     // Search outward inside the mask for the strongest non-green laser colour.
     for radius in 1..=CONTOUR_COLOR_SEARCH_RADIUS {
         let mut best = None;
@@ -401,17 +428,17 @@ fn foreground_color(
                     continue;
                 }
 
-                let candidate_x = x as i32 + offset_x;
-                let candidate_y = y as i32 + offset_y;
+                let candidate_x = x + offset_x;
+                let candidate_y = y + offset_y;
                 if candidate_x < 0
                     || candidate_y < 0
-                    || candidate_x >= width as i32
-                    || candidate_y >= height as i32
+                    || candidate_x >= signed_width
+                    || candidate_y >= signed_height
                 {
                     continue;
                 }
 
-                let candidate = candidate_y as usize * width + candidate_x as usize;
+                let candidate = candidate_y.cast_unsigned() * width + candidate_x.cast_unsigned();
                 if person_mask[candidate] == 0 {
                     continue;
                 }
@@ -448,7 +475,7 @@ fn is_green_screen([red, green, blue]: [u8; 3]) -> bool {
 fn laser_color_score([red, green, blue]: [u8; 3]) -> u16 {
     let brightest = red.max(green).max(blue);
     let darkest = red.min(green).min(blue);
-    brightest as u16 * 2 + (brightest - darkest) as u16
+    u16::from(brightest) * 2 + u16::from(brightest - darkest)
 }
 
 fn empty_frame(transform: LetterboxTransform) -> YoloFrame {
