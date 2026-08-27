@@ -15,8 +15,6 @@ pub const DEFAULT_MAX_THRESHOLD: f32 = 1.0;
 
 /// Images produced by the GPU edge-detection pipeline.
 pub struct EdgeDetectionImages {
-    /// Original colour image supplied to the GPU pipeline.
-    pub original: RgbaImage,
     /// Display-ready images copied from intermediate CUDA buffers.
     pub previews: EdgeDetectionPreviews,
     /// Binary laser mask thresholded directly from the Scharr magnitude.
@@ -273,7 +271,6 @@ impl CudaEdgeDetector {
         };
 
         Ok(EdgeDetectionImages {
-            original: rgba,
             previews,
             laser_edges: image(laser_edges)?,
             edge_pixels,
