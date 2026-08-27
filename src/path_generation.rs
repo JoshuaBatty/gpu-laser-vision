@@ -1,9 +1,6 @@
-//! Conversion from a thinned edge image into vector and laser paths.
-
-use std::collections::HashSet;
+//! Conversion from a thinned edge image into laser paths.
 
 use image::{GrayImage, RgbImage};
-use nannou::lyon::{math::point, path::Path};
 use nannou_laser::Point as LaserPoint;
 
 const NEIGHBOR_OFFSETS: [(isize, isize); 8] = [
@@ -17,19 +14,13 @@ const NEIGHBOR_OFFSETS: [(isize, isize); 8] = [
     (1, -1),
 ];
 
-/// A Lyon path and the equivalent line sequences accepted by `nannou_laser`.
+/// Point and line sequences accepted by `nannou_laser`.
 pub struct LaserPath {
-    lyon_path: Path,
     laser_points: Vec<LaserPoint>,
     laser_lines: Vec<Vec<LaserPoint>>,
 }
 
 impl LaserPath {
-    /// The vector path used for on-screen rendering.
-    pub fn lyon_path(&self) -> &Path {
-        &self.lyon_path
-    }
-
     /// Isolated points ready to submit with `nannou_laser::Frame::add_points`.
     pub fn laser_points(&self) -> &[LaserPoint] {
         &self.laser_points
@@ -46,57 +37,98 @@ impl LaserPath {
     }
 }
 
+/// Pixel indices forming one open path or closed loop.
 struct PixelLine {
     pixels: Vec<usize>,
     closed: bool,
 }
 
-/// Traces the non-zero pixels in a hysteresis image into ordered vector paths.
-pub fn from_hysteresis(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
+/// Adjacent active pixel and its index in the clockwise offset table.
+#[derive(Clone, Copy)]
+struct Neighbor {
+    pixel: usize,
+    direction: u8,
+}
+
+/// Fixed-capacity neighborhood of one mask pixel.
+struct Neighbors {
+    entries: [Neighbor; 8],
+    len: usize,
+}
+
+impl Neighbors {
+    fn iter(&self) -> impl Iterator<Item = Neighbor> + '_ {
+        self.entries[..self.len].iter().copied()
+    }
+}
+
+/// Traces the supplied non-zero mask pixels into ordered vector paths.
+///
+/// `active_pixels` must be sorted in row-major order and contain every non-zero
+/// pixel in `image` exactly once.
+pub fn from_edge_mask(
+    image: &GrayImage,
+    edge_colors: &RgbImage,
+    active_pixels: &[usize],
+) -> LaserPath {
     let width = image.width() as usize;
     let height = image.height() as usize;
-    let active: Vec<_> = image.as_raw().iter().map(|&value| value != 0).collect();
-    let mut visited_edges = HashSet::new();
+    let pixels = image.as_raw();
+    debug_assert_eq!(image.dimensions(), edge_colors.dimensions());
+    debug_assert!(active_pixels.windows(2).all(|pair| pair[0] < pair[1]));
+    debug_assert!(
+        active_pixels
+            .iter()
+            .all(|&pixel| pixels.get(pixel).is_some_and(|&value| value != 0))
+    );
+    let mut degrees = vec![0; pixels.len()];
+    let mut isolated_pixels = Vec::new();
+    for &pixel in active_pixels {
+        let degree = neighbors(pixel, width, height, pixels).len;
+        degrees[pixel] = u8::try_from(degree).expect("a pixel has at most eight neighbors");
+        if degree == 0 {
+            isolated_pixels.push(pixel);
+        }
+    }
+
+    // Each bit records whether the edge in the corresponding neighbor
+    // direction has been visited. This is both denser and faster than hashing
+    // a pair of pixel indices for every edge in a frame-sized image.
+    let mut visited_directions = vec![0_u8; pixels.len()];
     let mut lines = Vec::new();
-    let isolated_pixels: Vec<_> = (0..active.len())
-        .filter(|&pixel| {
-            active[pixel] && neighbors(pixel, width, height, &active).is_empty()
-        })
-        .collect();
 
     // Trace paths that begin or end at endpoints and junctions first.
-    for start in 0..active.len() {
-        if !active[start] || neighbors(start, width, height, &active).len() == 2 {
+    for &start in active_pixels {
+        if degrees[start] == 2 {
             continue;
         }
-        for next in neighbors(start, width, height, &active) {
-            if !visited_edges.contains(&edge(start, next)) {
+        for neighbor in neighbors(start, width, height, pixels).iter() {
+            if !edge_was_visited(&visited_directions, start, neighbor.direction) {
                 lines.push(trace_line(
                     start,
-                    next,
+                    neighbor,
                     width,
                     height,
-                    &active,
-                    &mut visited_edges,
+                    pixels,
+                    &degrees,
+                    &mut visited_directions,
                 ));
             }
         }
     }
 
     // Any edges left belong to closed loops where every pixel has degree two.
-    for start in 0..active.len() {
-        if !active[start] {
-            continue;
-        }
-        for next in neighbors(start, width, height, &active) {
-            if !visited_edges.contains(&edge(start, next)) {
+    for &start in active_pixels {
+        for neighbor in neighbors(start, width, height, pixels).iter() {
+            if !edge_was_visited(&visited_directions, start, neighbor.direction) {
                 lines.push(trace_line(
                     start,
-                    next,
+                    neighbor,
                     width,
                     height,
-                    &active,
-                    &mut visited_edges,
+                    pixels,
+                    &degrees,
+                    &mut visited_directions,
                 ));
             }
         }
@@ -111,7 +143,6 @@ pub fn from_hysteresis(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
         .filter(|line| line.pixels.len() >= if line.closed { 3 } else { 2 })
         .collect();
 
-    let mut lyon_builder = Path::builder();
     let laser_points = isolated_pixels
         .into_iter()
         .map(|pixel| {
@@ -135,15 +166,6 @@ pub fn from_hysteresis(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
             })
             .collect();
 
-        lyon_builder.begin(point(
-            laser_line[0].position[0],
-            laser_line[0].position[1],
-        ));
-        for laser_point in &laser_line[1..] {
-            lyon_builder.line_to(point(laser_point.position[0], laser_point.position[1]));
-        }
-        lyon_builder.end(line.closed);
-
         if line.closed {
             laser_line.push(laser_line[0]);
         }
@@ -151,7 +173,6 @@ pub fn from_hysteresis(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
     }
 
     LaserPath {
-        lyon_path: lyon_builder.build(),
         laser_points,
         laser_lines,
     }
@@ -159,68 +180,95 @@ pub fn from_hysteresis(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
 
 fn trace_line(
     start: usize,
-    next: usize,
+    next: Neighbor,
     width: usize,
     height: usize,
-    active: &[bool],
-    visited_edges: &mut HashSet<(usize, usize)>,
+    pixels: &[u8],
+    degrees: &[u8],
+    visited_directions: &mut [u8],
 ) -> PixelLine {
-    let mut pixels = vec![start];
+    let mut line_pixels = vec![start];
     let mut previous = start;
-    let mut current = next;
-    visited_edges.insert(edge(start, next));
+    let mut current = next.pixel;
+    visit_edge(visited_directions, start, next);
 
     while current != start {
-        pixels.push(current);
-        let adjacent = neighbors(current, width, height, active);
-        if adjacent.len() != 2 {
+        line_pixels.push(current);
+        if degrees[current] != 2 {
             break;
         }
-        let Some(next) = adjacent
-            .into_iter()
-            .find(|&candidate| candidate != previous && !visited_edges.contains(&edge(current, candidate)))
+        let Some(next) = neighbors(current, width, height, pixels)
+            .iter()
+            .find(|neighbor| {
+                neighbor.pixel != previous
+                    && !edge_was_visited(visited_directions, current, neighbor.direction)
+            })
         else {
             break;
         };
-        visited_edges.insert(edge(current, next));
+        visit_edge(visited_directions, current, next);
         previous = current;
-        current = next;
+        current = next.pixel;
     }
 
     PixelLine {
-        pixels,
+        pixels: line_pixels,
         closed: current == start,
     }
 }
 
-fn neighbors(pixel: usize, width: usize, height: usize, active: &[bool]) -> Vec<usize> {
-    let x = (pixel % width) as isize;
-    let y = (pixel / width) as isize;
-    let mut result = Vec::with_capacity(8);
+fn neighbors(pixel: usize, width: usize, height: usize, pixels: &[u8]) -> Neighbors {
+    let x = signed_coordinate(pixel % width);
+    let y = signed_coordinate(pixel / width);
+    let signed_width = signed_coordinate(width);
+    let signed_height = signed_coordinate(height);
+    let mut result = Neighbors {
+        entries: [Neighbor {
+            pixel: 0,
+            direction: 0,
+        }; 8],
+        len: 0,
+    };
 
-    for (dx, dy) in NEIGHBOR_OFFSETS {
+    for (direction, (dx, dy)) in NEIGHBOR_OFFSETS.into_iter().enumerate() {
         let next_x = x + dx;
         let next_y = y + dy;
-        if next_x < 0 || next_y < 0 || next_x >= width as isize || next_y >= height as isize {
+        if next_x < 0 || next_y < 0 || next_x >= signed_width || next_y >= signed_height {
             continue;
         }
-        let next = next_y as usize * width + next_x as usize;
-        if !active[next] {
+        let next_x = usize::try_from(next_x).expect("non-negative coordinate");
+        let next_y = usize::try_from(next_y).expect("non-negative coordinate");
+        let next = next_y * width + next_x;
+        if pixels[next] == 0 {
             continue;
         }
 
         // Prefer orthogonal links when present to avoid redundant diagonal triangles.
         if dx != 0 && dy != 0 {
-            let horizontal = y as usize * width + next_x as usize;
-            let vertical = next_y as usize * width + x as usize;
-            if active[horizontal] || active[vertical] {
+            let horizontal = y.cast_unsigned() * width + next_x;
+            let vertical = next_y * width + x.cast_unsigned();
+            if pixels[horizontal] != 0 || pixels[vertical] != 0 {
                 continue;
             }
         }
-        result.push(next);
+        result.entries[result.len] = Neighbor {
+            pixel: next,
+            direction: u8::try_from(direction).expect("neighbor direction fits in three bits"),
+        };
+        result.len += 1;
     }
 
     result
+}
+
+fn edge_was_visited(visited_directions: &[u8], pixel: usize, direction: u8) -> bool {
+    visited_directions[pixel] & (1 << direction) != 0
+}
+
+fn visit_edge(visited_directions: &mut [u8], pixel: usize, neighbor: Neighbor) {
+    visited_directions[pixel] |= 1 << neighbor.direction;
+    // Opposite directions are four positions apart in NEIGHBOR_OFFSETS.
+    visited_directions[neighbor.pixel] |= 1 << ((neighbor.direction + 4) % 8);
 }
 
 fn collapse_straight_runs(pixels: Vec<usize>, closed: bool, width: usize) -> Vec<usize> {
@@ -255,27 +303,31 @@ fn collapse_straight_runs(pixels: Vec<usize>, closed: bool, width: usize) -> Vec
 }
 
 fn direction(from: usize, to: usize, width: usize) -> (isize, isize) {
-    let from = ((from % width) as isize, (from / width) as isize);
-    let to = ((to % width) as isize, (to / width) as isize);
+    let from = (
+        signed_coordinate(from % width),
+        signed_coordinate(from / width),
+    );
+    let to = (signed_coordinate(to % width), signed_coordinate(to / width));
     (to.0 - from.0, to.1 - from.1)
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn normalize(pixel: usize, width: usize, height: usize) -> [f32; 2] {
     let x = (pixel % width) as f32 / width.saturating_sub(1).max(1) as f32;
     let y = (pixel / width) as f32 / height.saturating_sub(1).max(1) as f32;
     [x * 2.0 - 1.0, 1.0 - y * 2.0]
 }
 
+fn signed_coordinate(value: usize) -> isize {
+    isize::try_from(value).expect("image coordinates fit in isize")
+}
+
 fn laser_color(pixel: usize, edge_colors: &RgbImage) -> [f32; 3] {
     let source = pixel * 3;
     let colors = edge_colors.as_raw();
     [
-        colors[source] as f32 / 255.0,
-        colors[source + 1] as f32 / 255.0,
-        colors[source + 2] as f32 / 255.0,
+        f32::from(colors[source]) / 255.0,
+        f32::from(colors[source + 1]) / 255.0,
+        f32::from(colors[source + 2]) / 255.0,
     ]
-}
-
-fn edge(a: usize, b: usize) -> (usize, usize) {
-    if a < b { (a, b) } else { (b, a) }
 }
