@@ -37,17 +37,20 @@ impl LaserPath {
     }
 }
 
+/// Pixel indices forming one open path or closed loop.
 struct PixelLine {
     pixels: Vec<usize>,
     closed: bool,
 }
 
+/// Adjacent active pixel and its index in the clockwise offset table.
 #[derive(Clone, Copy)]
 struct Neighbor {
     pixel: usize,
     direction: u8,
 }
 
+/// Fixed-capacity neighborhood of one mask pixel.
 struct Neighbors {
     entries: [Neighbor; 8],
     len: usize,
@@ -260,6 +263,7 @@ fn edge_was_visited(visited_directions: &[u8], pixel: usize, direction: u8) -> b
 
 fn visit_edge(visited_directions: &mut [u8], pixel: usize, neighbor: Neighbor) {
     visited_directions[pixel] |= 1 << neighbor.direction;
+    // Opposite directions are four positions apart in NEIGHBOR_OFFSETS.
     visited_directions[neighbor.pixel] |= 1 << ((neighbor.direction + 4) % 8);
 }
 

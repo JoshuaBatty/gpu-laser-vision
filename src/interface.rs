@@ -1,6 +1,10 @@
+//! Dashboard layout, styling, and drawing primitives.
+
 use nannou::prelude::*;
 
+/// Height reserved for the application header.
 pub const HEADER_HEIGHT: f32 = 68.0;
+/// Width reserved for controls and metrics.
 pub const SIDEBAR_WIDTH: f32 = 244.0;
 
 const PAGE_MARGIN: f32 = 16.0;
@@ -9,16 +13,23 @@ const CARD_HEADER_HEIGHT: f32 = 38.0;
 const CARD_PADDING: f32 = 9.0;
 const MEDIA_ASPECT_RATIO: f32 = 16.0 / 9.0;
 
+/// Semantic accent used across egui and nannou drawing.
 #[derive(Clone, Copy)]
 pub enum Accent {
+    /// Source video and general pipeline state.
     Neutral,
+    /// Custom CUDA edge pipeline.
     Cuda,
+    /// YOLO segmentation pipeline.
     Yolo,
+    /// Intermediate debug stages.
     Diagnostic,
+    /// Pipeline failure state.
     Error,
 }
 
 impl Accent {
+    /// Returns the nannou colour for this accent.
     pub fn draw_color(self) -> Color {
         match self {
             Self::Neutral => Color::srgb_u8(120, 132, 145),
@@ -29,6 +40,7 @@ impl Accent {
         }
     }
 
+    /// Returns the egui colour for this accent.
     pub fn ui_color(self) -> egui::Color32 {
         match self {
             Self::Neutral => egui::Color32::from_rgb(120, 132, 145),
@@ -40,19 +52,26 @@ impl Accent {
     }
 }
 
+/// Center-based rectangle used by the nannou dashboard renderer.
 #[derive(Clone, Copy)]
 pub struct CardRect {
+    /// Horizontal center in nannou window coordinates.
     pub x: f32,
+    /// Vertical center in nannou window coordinates.
     pub y: f32,
+    /// Rectangle width.
     pub width: f32,
+    /// Rectangle height.
     pub height: f32,
 }
 
 impl CardRect {
+    /// Returns the upper edge in nannou window coordinates.
     pub fn top(self) -> f32 {
         self.y + self.height * 0.5
     }
 
+    /// Fits a centered 16:9 canvas below the card header.
     pub fn media_rect(self) -> Self {
         let available_width = (self.width - CARD_PADDING * 2.0).max(1.0);
         let available_height = (self.height - CARD_HEADER_HEIGHT - CARD_PADDING * 2.0).max(1.0);
@@ -72,13 +91,18 @@ impl CardRect {
     }
 }
 
+/// Ordered card groups for the three dashboard tiers.
 pub struct DashboardLayout {
+    /// Source, CUDA contour, and YOLO contour cards.
     pub hero: [CardRect; 3],
+    /// CUDA and YOLO laser output cards.
     pub outputs: [CardRect; 2],
+    /// Grayscale, Scharr, CUDA mask, and YOLO mask cards.
     pub diagnostics: [CardRect; 4],
 }
 
 impl DashboardLayout {
+    /// Computes a responsive layout inside the current window.
     pub fn new(window: Rect) -> Self {
         let content_left = window.left() + SIDEBAR_WIDTH + PAGE_MARGIN;
         let content_right = window.right() - PAGE_MARGIN;
@@ -124,10 +148,12 @@ fn row<const COUNT: usize>(
     })
 }
 
+/// Returns the application background colour.
 pub fn background() -> Color {
     Color::srgb_u8(8, 11, 14)
 }
 
+/// Installs the dashboard's egui style on a window context.
 pub fn configure_egui(context: &egui::Context) {
     let mut style = (*context.global_style()).clone();
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
@@ -148,6 +174,7 @@ pub fn configure_egui(context: &egui::Context) {
     context.set_global_style(style);
 }
 
+/// Builds the top-header frame style.
 pub fn header_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(11, 15, 18))
@@ -155,6 +182,7 @@ pub fn header_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(34, 42, 48)))
 }
 
+/// Builds the control-rail frame style.
 pub fn sidebar_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(14, 18, 22))
@@ -162,6 +190,7 @@ pub fn sidebar_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(34, 42, 48)))
 }
 
+/// Draws a compact control-rail section label.
 pub fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
         egui::RichText::new(text)
@@ -171,6 +200,7 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
     );
 }
 
+/// Draws one left-label, right-value metrics row.
 pub fn metric_row(ui: &mut egui::Ui, label: &str, value: impl Into<egui::WidgetText>) {
     ui.horizontal(|ui| {
         ui.label(
@@ -184,6 +214,7 @@ pub fn metric_row(ui: &mut egui::Ui, label: &str, value: impl Into<egui::WidgetT
     });
 }
 
+/// Draws a labelled status chip in the selected accent.
 pub fn status_chip(ui: &mut egui::Ui, label: &str, value: &str, accent: Accent) {
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(20, 26, 31))
@@ -208,6 +239,7 @@ pub fn status_chip(ui: &mut egui::Ui, label: &str, value: &str, accent: Accent) 
         });
 }
 
+/// Draws a card frame and returns its fitted media canvas.
 pub fn draw_card_shell(
     draw: &Draw,
     card: CardRect,
@@ -255,6 +287,7 @@ pub fn draw_card_shell(
     media
 }
 
+/// Draws an image texture into a fitted media canvas.
 pub fn draw_texture(draw: &Draw, image: &Handle<Image>, media: CardRect) {
     draw.rect()
         .x_y(media.x, media.y)
@@ -263,6 +296,7 @@ pub fn draw_texture(draw: &Draw, image: &Handle<Image>, media: CardRect) {
         .texture(image);
 }
 
+/// Draws a centered placeholder message inside a media canvas.
 pub fn draw_empty_state(draw: &Draw, media: CardRect, message: &str) {
     draw.text(message)
         .x_y(media.x, media.y)

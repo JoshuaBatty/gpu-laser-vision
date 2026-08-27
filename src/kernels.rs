@@ -9,6 +9,7 @@ mod device {
 
     const COLOR_SAMPLE_DISTANCE: usize = 2;
 
+    /// Converts packed row-major RGBA pixels to normalized luminance.
     #[kernel]
     pub fn convert_to_grayscale(rgba: &[u8], mut b: DisjointSlice<f32>) {
         if let Some((b_elem, idx)) = b.get_mut_indexed() {
@@ -20,6 +21,7 @@ mod device {
         }
     }
 
+    /// Writes normalized Scharr magnitude and its horizontal and vertical gradients.
     #[kernel]
     pub fn scharr(
         gray: &[f32],
