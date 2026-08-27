@@ -85,7 +85,7 @@ pub fn from_edge_mask(
     let mut isolated_pixels = Vec::new();
     for &pixel in active_pixels {
         let degree = neighbors(pixel, width, height, pixels).len;
-        degrees[pixel] = degree as u8;
+        degrees[pixel] = u8::try_from(degree).expect("a pixel has at most eight neighbors");
         if degree == 0 {
             isolated_pixels.push(pixel);
         }
@@ -218,8 +218,10 @@ fn trace_line(
 }
 
 fn neighbors(pixel: usize, width: usize, height: usize, pixels: &[u8]) -> Neighbors {
-    let x = (pixel % width) as isize;
-    let y = (pixel / width) as isize;
+    let x = signed_coordinate(pixel % width);
+    let y = signed_coordinate(pixel / width);
+    let signed_width = signed_coordinate(width);
+    let signed_height = signed_coordinate(height);
     let mut result = Neighbors {
         entries: [Neighbor {
             pixel: 0,
@@ -231,25 +233,27 @@ fn neighbors(pixel: usize, width: usize, height: usize, pixels: &[u8]) -> Neighb
     for (direction, (dx, dy)) in NEIGHBOR_OFFSETS.into_iter().enumerate() {
         let next_x = x + dx;
         let next_y = y + dy;
-        if next_x < 0 || next_y < 0 || next_x >= width as isize || next_y >= height as isize {
+        if next_x < 0 || next_y < 0 || next_x >= signed_width || next_y >= signed_height {
             continue;
         }
-        let next = next_y as usize * width + next_x as usize;
+        let next_x = usize::try_from(next_x).expect("non-negative coordinate");
+        let next_y = usize::try_from(next_y).expect("non-negative coordinate");
+        let next = next_y * width + next_x;
         if pixels[next] == 0 {
             continue;
         }
 
         // Prefer orthogonal links when present to avoid redundant diagonal triangles.
         if dx != 0 && dy != 0 {
-            let horizontal = y as usize * width + next_x as usize;
-            let vertical = next_y as usize * width + x as usize;
+            let horizontal = y.cast_unsigned() * width + next_x;
+            let vertical = next_y * width + x.cast_unsigned();
             if pixels[horizontal] != 0 || pixels[vertical] != 0 {
                 continue;
             }
         }
         result.entries[result.len] = Neighbor {
             pixel: next,
-            direction: direction as u8,
+            direction: u8::try_from(direction).expect("neighbor direction fits in three bits"),
         };
         result.len += 1;
     }
@@ -299,23 +303,31 @@ fn collapse_straight_runs(pixels: Vec<usize>, closed: bool, width: usize) -> Vec
 }
 
 fn direction(from: usize, to: usize, width: usize) -> (isize, isize) {
-    let from = ((from % width) as isize, (from / width) as isize);
-    let to = ((to % width) as isize, (to / width) as isize);
+    let from = (
+        signed_coordinate(from % width),
+        signed_coordinate(from / width),
+    );
+    let to = (signed_coordinate(to % width), signed_coordinate(to / width));
     (to.0 - from.0, to.1 - from.1)
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn normalize(pixel: usize, width: usize, height: usize) -> [f32; 2] {
     let x = (pixel % width) as f32 / width.saturating_sub(1).max(1) as f32;
     let y = (pixel / width) as f32 / height.saturating_sub(1).max(1) as f32;
     [x * 2.0 - 1.0, 1.0 - y * 2.0]
 }
 
+fn signed_coordinate(value: usize) -> isize {
+    isize::try_from(value).expect("image coordinates fit in isize")
+}
+
 fn laser_color(pixel: usize, edge_colors: &RgbImage) -> [f32; 3] {
     let source = pixel * 3;
     let colors = edge_colors.as_raw();
     [
-        colors[source] as f32 / 255.0,
-        colors[source + 1] as f32 / 255.0,
-        colors[source + 2] as f32 / 255.0,
+        f32::from(colors[source]) / 255.0,
+        f32::from(colors[source + 1]) / 255.0,
+        f32::from(colors[source + 2]) / 255.0,
     ]
 }

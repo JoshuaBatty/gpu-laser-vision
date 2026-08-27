@@ -1,9 +1,11 @@
 //! Ether Dream discovery and laser frame streaming.
 
-use std::io::ErrorKind;
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
-use std::time::Duration;
+use std::{
+    io::ErrorKind,
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Duration,
+};
 
 use nannou_laser::{DacId, DetectedDac, Frame, Point};
 
@@ -40,10 +42,10 @@ impl EtherDreamStream {
 
     /// Returns the latest discovery or stream status for display.
     pub fn status(&self) -> String {
-        self.status
-            .lock()
-            .map(|status| status.clone())
-            .unwrap_or_else(|_| String::from("status unavailable"))
+        self.status.lock().map_or_else(
+            |_| String::from("status unavailable"),
+            |status| status.clone(),
+        )
     }
 }
 
@@ -61,6 +63,8 @@ struct FrameModel {
     lines: Vec<Vec<Point>>,
 }
 
+// The worker owns these values so the stream and shutdown channel remain valid.
+#[allow(clippy::needless_pass_by_value)]
 fn run(frame_model: FrameModel, status: Arc<Mutex<String>>, stop_rx: mpsc::Receiver<()>) {
     let api = nannou_laser::Api::new();
     let mut detected_dacs = match api.detect_dacs() {

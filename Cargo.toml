@@ -7,6 +7,9 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/JoshuaBatty/gpu-laser-vision"
 readme = "README.md"
 
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+
 [dependencies]
 cutile-cuda-async = { git = "https://github.com/NVlabs/cutile-rs", rev = "d0d2ba9a8a897f1ef03f9d4556747dc35d47d613", package = "cuda-async" }
 cutile-cuda-core = { git = "https://github.com/NVlabs/cutile-rs", rev = "d0d2ba9a8a897f1ef03f9d4556747dc35d47d613", package = "cuda-core" }
