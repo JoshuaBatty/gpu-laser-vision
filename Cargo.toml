@@ -1,6 +1,7 @@
 [package]
 name = "nannou-laser-cuda"
 version = "0.1.0"
+authors = ["Joshua Batty"]
 edition = "2024"
 description = "Real-time CUDA and YOLO vision pipeline for coloured laser geometry"
 license = "AGPL-3.0-only"
@@ -11,16 +12,16 @@ readme = "README.md"
 pedantic = { level = "deny", priority = -1 }
 
 [dependencies]
-cutile-cuda-async = { git = "https://github.com/NVlabs/cutile-rs", rev = "d0d2ba9a8a897f1ef03f9d4556747dc35d47d613", package = "cuda-async" }
-cutile-cuda-core = { git = "https://github.com/NVlabs/cutile-rs", rev = "d0d2ba9a8a897f1ef03f9d4556747dc35d47d613", package = "cuda-core" }
 anyhow = "1"
 bevy = { version = "0.19.0", default-features = false }
-image = "0.25"
-nannou = { version = "0.20.0", features = ["egui", "video"] }
 cuda-async = { git = "https://github.com/NVlabs/cuda-oxide", rev = "a105afd522b73a6712a802e30bd900cd04cc8019" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide", rev = "a105afd522b73a6712a802e30bd900cd04cc8019" }
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide", rev = "a105afd522b73a6712a802e30bd900cd04cc8019" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide", rev = "a105afd522b73a6712a802e30bd900cd04cc8019" }
+cutile-cuda-async = { git = "https://github.com/NVlabs/cutile-rs", rev = "d0d2ba9a8a897f1ef03f9d4556747dc35d47d613", package = "cuda-async" }
+cutile-cuda-core = { git = "https://github.com/NVlabs/cutile-rs", rev = "d0d2ba9a8a897f1ef03f9d4556747dc35d47d613", package = "cuda-core" }
+image = "0.25"
+nannou = { version = "0.20.0", features = ["egui", "video"] }
 nannou_laser = "0.20.0"
 # tch releases target one exact PyTorch C++ API version. This matches the
 # PyTorch 2.11.0 package pinned by flake.nix.
