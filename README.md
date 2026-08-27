@@ -12,7 +12,7 @@
 
 </div>
 
-![GPU Laser Vision dashboard](docs/media/dashboard.png)
+[![GPU Laser Vision dashboard — click to watch the 1080p demo](docs/media/dashboard.png)](docs/media/demo.mp4)
 
 GPU Laser Vision compares two live 720p pipelines side by side: a custom CUDA
 edge detector and CUDA-backed YOLO11 instance segmentation. Both recover source
@@ -21,10 +21,9 @@ colours, extract contours, and produce normalized paths compatible with
 
 ## Live demo
 
-![Live CUDA and YOLO pipeline](docs/media/demo.gif)
-
-[Download the 720p H.264 recording](docs/media/demo.mp4) · Captured from the
-release build with every preview updating on every source frame.
+[Watch the complete 1080p H.264 recording](docs/media/demo.mp4) · 3:01 at 25 FPS,
+captured from the release build with every preview updating on every source
+frame and encoded with HandBrake.
 
 ## At a glance
 
