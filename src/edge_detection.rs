@@ -1,15 +1,19 @@
 //! GPU-accelerated edge-detection pipeline.
 //!
-//! This module owns the CUDA setup and kernel execution, then reconstructs
-//! each processing stage as a host-side image.
+//! This module owns the CUDA setup and kernel execution, then reconstructs the
+//! retained debug outputs as host-side images.
 
-use crate::kernels;
+use crate::{cuda_graph::CapturedCudaGraph, kernels};
 use anyhow::{Context, Result};
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig, PinnedHostBuffer};
+use cutile_cuda_async::error::DeviceError;
 use image::{GrayImage, ImageReader, RgbImage, RgbaImage};
-use std::path::Path;
+use std::{fmt::Display, path::Path, sync::Arc};
 
-/// Images produced by each stage of the GPU edge-detection pipeline.
+pub const DEFAULT_MIN_THRESHOLD: f32 = 0.5;
+pub const DEFAULT_MAX_THRESHOLD: f32 = 1.0;
+
+/// Images produced by the GPU edge-detection pipeline.
 pub struct EdgeDetectionImages {
     /// Original colour image supplied to the GPU pipeline.
     pub original: RgbaImage,
@@ -17,222 +21,253 @@ pub struct EdgeDetectionImages {
     pub grayscale: GrayImage,
     /// Gradient magnitude produced by the Scharr operator.
     pub edges: GrayImage,
-    /// Edges thinned by non-maximum suppression.
-    pub thin_edges: GrayImage,
-    /// Weak and strong edge classes produced by double thresholding.
-    pub edge_classes: GrayImage,
-    /// Final edges retained after hysteresis connectivity tracking.
-    pub connected_edges: GrayImage,
+    /// Binary laser mask thresholded directly from the Scharr magnitude.
+    pub laser_edges: GrayImage,
     /// Original source colours sampled around each final edge on the GPU.
     pub edge_colors: RgbImage,
 }
 
+/// Device allocations and CUDA objects referenced by the captured graph.
+struct EdgeGraphResources {
+    module: kernels::LoadedModule,
+    stream: Arc<CudaStream>,
+    input_rgba: DeviceBuffer<u8>,
+    grayscale: DeviceBuffer<f32>,
+    scharr_magnitude: DeviceBuffer<f32>,
+    thresholds: DeviceBuffer<f32>,
+    gradient_x: DeviceBuffer<f32>,
+    gradient_y: DeviceBuffer<f32>,
+    grayscale_preview: DeviceBuffer<u8>,
+    scharr_preview: DeviceBuffer<u8>,
+    edge_colors: DeviceBuffer<u32>,
+}
+
+/// Pinned staging memory for results copied back from the GPU.
+struct HostOutputs {
+    grayscale: PinnedHostBuffer<u8>,
+    scharr_magnitude: PinnedHostBuffer<u8>,
+    edge_colors: PinnedHostBuffer<u32>,
+}
+
+/// Persistent CUDA resources and captured graph for one frame size.
+pub struct CudaEdgeDetector {
+    graph: CapturedCudaGraph<EdgeGraphResources>,
+    host: HostOutputs,
+    width: u32,
+    height: u32,
+}
+
 /// Runs the GPU edge-detection pipeline on the image at `path`.
 ///
-/// Returns the output of every stage, or an error from image loading, CUDA
-/// setup and execution, or reconstruction of the output images.
+/// Returns the retained outputs, or an error from image loading, CUDA setup
+/// and execution, or reconstruction of the output images.
 pub fn process(path: impl AsRef<Path>) -> Result<EdgeDetectionImages> {
-    // Initialize CUDA
-    let ctx = CudaContext::new(0)?;
-
-    // Init CUDA streams
-    let grayscale_stream = ctx.new_stream()?;
-    let edge_stream = ctx.new_stream()?;
-    let nms_stream = ctx.new_stream()?;
-    let threshold_stream = ctx.new_stream()?;
-    let hysteresis_stream = ctx.new_stream()?;
-
-    // Load an image
     let path = path.as_ref();
-    let img = ImageReader::open(path)
+    let rgba = ImageReader::open(path)
         .with_context(|| format!("opening {}", path.display()))?
-        .decode()?;
+        .decode()?
+        .into_rgba8();
 
-    let w = img.width() as usize;
-    let h = img.height() as usize;
-    let n = w * h;
-    let rgba = img.into_rgba8();
+    process_rgba(rgba)
+}
 
-    // Allocate device memory
-    let rgba_dev = DeviceBuffer::from_host(&grayscale_stream, rgba.as_raw())?;
-    let mut grayscale_dev = DeviceBuffer::<f32>::zeroed(&grayscale_stream, n)?;
-    let mut edges_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, n)?;
-    let mut thin_edges_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, n)?;
-    let mut edge_classes_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, n)?;
-    let mut connected_edges_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, n)?;
-    let mut connected_edges_next_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, n)?;
-    let mut grad_x_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, n)?;
-    let mut grad_y_dev = DeviceBuffer::<f32>::zeroed(&edge_stream, n)?;
-    let mut edge_colors_dev = DeviceBuffer::<u32>::zeroed(&hysteresis_stream, n)?;
+/// Runs the GPU edge-detection pipeline on an in-memory RGBA image.
+pub fn process_rgba(rgba: RgbaImage) -> Result<EdgeDetectionImages> {
+    let mut detector = CudaEdgeDetector::new(rgba.width(), rgba.height())?;
+    detector.process(&rgba, DEFAULT_MIN_THRESHOLD, DEFAULT_MAX_THRESHOLD)
+}
 
-    // Load embedded PTX module, exposes generated kernel launchers.
-    let module = kernels::load(&ctx).context("loading embedded CUDA module")?;
+impl CudaEdgeDetector {
+    /// Allocates frame-sized resources and captures the CUDA graph.
+    pub fn new(width: u32, height: u32) -> Result<Self> {
+        let w = width as usize;
+        let h = height as usize;
+        let n = w * h;
+        anyhow::ensure!(width > 0 && height > 0, "frame dimensions must be non-zero");
 
-    // Launch grayscale conversion kernel.
-    unsafe {
-        module.convert_to_grayscale(
-            &grayscale_stream,
-            LaunchConfig::for_num_elems(n as u32),
-            &rgba_dev,
-            &mut grayscale_dev,
-        )
+        // Initialize CUDA once for every sequence of equally sized frames.
+        let context = CudaContext::new(0)?;
+        let stream = context.new_stream()?;
+        let resources = EdgeGraphResources {
+            module: kernels::load(&context).context("loading embedded CUDA module")?,
+            stream: Arc::clone(&stream),
+            input_rgba: DeviceBuffer::zeroed(&stream, n * 4)?,
+            grayscale: DeviceBuffer::zeroed(&stream, n)?,
+            scharr_magnitude: DeviceBuffer::zeroed(&stream, n)?,
+            thresholds: DeviceBuffer::zeroed(&stream, 2)?,
+            gradient_x: DeviceBuffer::zeroed(&stream, n)?,
+            gradient_y: DeviceBuffer::zeroed(&stream, n)?,
+            grayscale_preview: DeviceBuffer::zeroed(&stream, n)?,
+            scharr_preview: DeviceBuffer::zeroed(&stream, n)?,
+            edge_colors: DeviceBuffer::zeroed(&stream, n)?,
+        };
+        let host = HostOutputs {
+            grayscale: PinnedHostBuffer::zeroed(&context, n)?,
+            scharr_magnitude: PinnedHostBuffer::zeroed(&context, n)?,
+            edge_colors: PinnedHostBuffer::zeroed(&context, n)?,
+        };
+
+        let graph = CapturedCudaGraph::capture(context, stream, resources, |resources| {
+            unsafe {
+                resources.module.convert_to_grayscale(
+                    &resources.stream,
+                    LaunchConfig::for_num_elems(n as u32),
+                    &resources.input_rgba,
+                    &mut resources.grayscale,
+                )
+            }
+            .capture_context("launching grayscale kernel")?;
+
+            unsafe {
+                resources.module.scharr(
+                    &resources.stream,
+                    LaunchConfig::for_num_elems(n as u32),
+                    &resources.grayscale,
+                    &mut resources.scharr_magnitude,
+                    &mut resources.gradient_x,
+                    &mut resources.gradient_y,
+                    w,
+                    h,
+                )
+            }
+            .capture_context("launching Scharr kernel")?;
+
+            unsafe {
+                resources.module.extract_laser_edges(
+                    &resources.stream,
+                    LaunchConfig::for_num_elems(n as u32),
+                    &resources.input_rgba,
+                    &resources.scharr_magnitude,
+                    &resources.gradient_x,
+                    &resources.gradient_y,
+                    &mut resources.edge_colors,
+                    w,
+                    &resources.thresholds,
+                )
+            }
+            .capture_context("extracting laser edges and colours")?;
+
+            unsafe {
+                resources.module.normalized_f32_to_u8(
+                    &resources.stream,
+                    LaunchConfig::for_num_elems(n as u32),
+                    &resources.grayscale,
+                    &mut resources.grayscale_preview,
+                )
+            }
+            .capture_context("converting grayscale output for display")?;
+
+            unsafe {
+                resources.module.normalized_f32_to_u8(
+                    &resources.stream,
+                    LaunchConfig::for_num_elems(n as u32),
+                    &resources.scharr_magnitude,
+                    &mut resources.scharr_preview,
+                )
+            }
+            .capture_context("converting Scharr output for display")?;
+            Ok(())
+        })?;
+
+        Ok(Self {
+            graph,
+            host,
+            width,
+            height,
+        })
     }
-    .context("launching grayscale kernel")?;
 
-    // Record when the grayscale kernal has completed its work.
-    let grayscale_done = grayscale_stream.record_event(None)?;
-
-    // Do not run edge detection until grayscale is complete.
-    edge_stream.wait(&grayscale_done)?;
-
-    // Launch the Scharr edge detection kernel.
-    unsafe {
-        module.scharr(
-            &edge_stream,
-            LaunchConfig::for_num_elems(n as u32),
-            &grayscale_dev,
-            &mut edges_dev,
-            &mut grad_x_dev,
-            &mut grad_y_dev,
-            w,
-            h,
-        )
+    /// Returns the frame dimensions accepted by this captured graph.
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
-    .context("launching Scharr kernel")?;
 
-    // Record when the edge kernal has completed its work.
-    let edge_done = edge_stream.record_event(None)?;
+    /// Processes one frame and copies the retained outputs back to the host.
+    pub fn process(
+        &mut self,
+        rgba: &RgbaImage,
+        min_threshold: f32,
+        max_threshold: f32,
+    ) -> Result<EdgeDetectionImages> {
+        anyhow::ensure!(
+            rgba.dimensions() == self.dimensions(),
+            "frame dimensions changed from {}x{} to {}x{}",
+            self.width,
+            self.height,
+            rgba.width(),
+            rgba.height()
+        );
+        anyhow::ensure!(
+            min_threshold.is_finite()
+                && max_threshold.is_finite()
+                && 0.0 <= min_threshold
+                && min_threshold <= max_threshold
+                && max_threshold <= 1.0,
+            "edge thresholds must satisfy 0 <= min <= max <= 1"
+        );
 
-    // Do not run nms until edge is complete.
-    nms_stream.wait(&edge_done)?;
-
-    // Launch the nms kernel.
-    unsafe {
-        module.non_maximum_suppression(
-            &nms_stream,
-            LaunchConfig::for_num_elems(n as u32),
-            &edges_dev,
-            &grad_x_dev,
-            &grad_y_dev,
-            &mut thin_edges_dev,
-            w,
-            h,
-        )
-    }
-    .context("launching non-maximum-suppression kernel")?;
-
-    // Record when the nms kernal has completed its work.
-    let nms_done = nms_stream.record_event(None)?;
-
-    // Do not run nms until edge is complete.
-    threshold_stream.wait(&nms_done)?;
-
-    let low_threshold: f32 = 0.022;
-    let high_threshold: f32 = 0.045;
-
-    // Launch the threshold kernel.
-    unsafe {
-        module.double_threshold(
-            &threshold_stream,
-            LaunchConfig::for_num_elems(n as u32),
-            &thin_edges_dev,
-            &mut edge_classes_dev,
-            low_threshold,
-            high_threshold,
-        )
-    }
-    .context("launching double-threshold kernel")?;
-
-    // Record when the threshold kernal has completed its work.
-    let threshold_done = threshold_stream.record_event(None)?;
-
-    // Do not run nms until threshold is complete.
-    hysteresis_stream.wait(&threshold_done)?;
-
-    // Launch the hysteresis kernel.
-    for _ in 0..64 {
-        unsafe {
-            module.hysteresis(
-                &hysteresis_stream,
-                LaunchConfig::for_num_elems(n as u32),
-                &edge_classes_dev,
-                &connected_edges_dev,
-                &mut connected_edges_next_dev,
-                w,
-                h,
-            )
+        let thresholds = [min_threshold, max_threshold];
+        {
+            let resources = self.graph.resources_mut();
+            // SAFETY: the following RGBA upload synchronizes this same stream
+            // before `thresholds` can be dropped or reused.
+            unsafe {
+                resources
+                    .thresholds
+                    .copy_from_host_async_unchecked(&resources.stream, &thresholds)?;
+            }
+            resources
+                .input_rgba
+                .copy_from_host(&resources.stream, rgba.as_raw())?;
         }
-        .context("launching hysteresis kernel")?;
+        self.graph.launch()?;
 
-        std::mem::swap(&mut connected_edges_dev, &mut connected_edges_next_dev);
-    }
+        let resources = self.graph.resources_mut();
+        resources
+            .grayscale_preview
+            .copy_to_pinned_host(&resources.stream, &mut self.host.grayscale)?;
+        resources
+            .scharr_preview
+            .copy_to_pinned_host(&resources.stream, &mut self.host.scharr_magnitude)?;
+        resources
+            .edge_colors
+            .copy_to_pinned_host(&resources.stream, &mut self.host.edge_colors)?;
 
-    unsafe {
-        module.colorize_edges(
-            &hysteresis_stream,
-            LaunchConfig::for_num_elems(n as u32),
-            &rgba_dev,
-            &connected_edges_dev,
-            &grad_x_dev,
-            &grad_y_dev,
-            &mut edge_colors_dev,
-            w,
-            h,
-            2,
-        )
-    }
-    .context("launching edge-colour recovery kernel")?;
-
-    // Get the results
-    let grayscale_host = grayscale_dev.to_host_vec(&grayscale_stream)?;
-    let edges_host = edges_dev.to_host_vec(&edge_stream)?;
-    let thin_edges_host = thin_edges_dev.to_host_vec(&nms_stream)?;
-    let edge_classes_host = edge_classes_dev.to_host_vec(&threshold_stream)?;
-    let connected_edges_host = connected_edges_dev.to_host_vec(&hysteresis_stream)?;
-    let edge_colors_host = edge_colors_dev.to_host_vec(&hysteresis_stream)?;
-
-    println!(
-        "Thin-edge max: {}",
-        thin_edges_host.iter().copied().fold(0.0_f32, f32::max)
-    );
-
-    // Convert float output to grayscale bytes and save png
-    let grayscale: Vec<u8> = normalized_f32_to_u8(&grayscale_host, 1.0);
-    let edges: Vec<u8> = normalized_f32_to_u8(&edges_host, 1.0);
-    let thin_edges: Vec<u8> = normalized_f32_to_u8(&thin_edges_host, 12.0);
-    let edge_classes: Vec<u8> = normalized_f32_to_u8(&edge_classes_host, 1.0);
-    let connected_edges: Vec<u8> = normalized_f32_to_u8(&connected_edges_host, 1.0);
-    let edge_colors: Vec<u8> = edge_colors_host
-        .into_iter()
-        .flat_map(|color| {
-            [
+        let mut laser_edges = Vec::with_capacity(self.host.edge_colors.len());
+        let mut edge_colors = Vec::with_capacity(self.host.edge_colors.len() * 3);
+        for color in self.host.edge_colors.iter().copied() {
+            laser_edges.push((color >> 24) as u8);
+            edge_colors.extend_from_slice(&[
                 (color & 0xff) as u8,
                 ((color >> 8) & 0xff) as u8,
                 ((color >> 16) & 0xff) as u8,
-            ]
+            ]);
+        }
+
+        let image = |data| {
+            GrayImage::from_raw(self.width, self.height, data).ok_or_else(|| {
+                anyhow::anyhow!("grayscale buffer size does not match image dimensions")
+            })
+        };
+
+        Ok(EdgeDetectionImages {
+            grayscale: image(self.host.grayscale.to_vec())?,
+            edges: image(self.host.scharr_magnitude.to_vec())?,
+            laser_edges: image(laser_edges)?,
+            edge_colors: RgbImage::from_raw(self.width, self.height, edge_colors).ok_or_else(
+                || anyhow::anyhow!("edge-colour buffer size does not match image dimensions"),
+            )?,
+            original: rgba.clone(),
         })
-        .collect();
-
-    let image = |data| {
-        GrayImage::from_raw(rgba.width(), rgba.height(), data)
-            .ok_or_else(|| anyhow::anyhow!("grayscale buffer size does not match image dimensions"))
-    };
-
-    Ok(EdgeDetectionImages {
-        grayscale: image(grayscale)?,
-        edges: image(edges)?,
-        thin_edges: image(thin_edges)?,
-        edge_classes: image(edge_classes)?,
-        connected_edges: image(connected_edges)?,
-        edge_colors: RgbImage::from_raw(rgba.width(), rgba.height(), edge_colors)
-            .ok_or_else(|| anyhow::anyhow!("edge-colour buffer size does not match image dimensions"))?,
-        original: rgba,
-    })
+    }
 }
 
-fn normalized_f32_to_u8(values: &[f32], gain: f32) -> Vec<u8> {
-    values
-        .iter()
-        .map(|&value| ((value * gain).clamp(0.0, 1.0) * 255.0) as u8)
-        .collect()
+trait CaptureResultExt<T> {
+    fn capture_context(self, operation: &'static str) -> std::result::Result<T, DeviceError>;
+}
+
+impl<T, E: Display> CaptureResultExt<T> for std::result::Result<T, E> {
+    fn capture_context(self, operation: &'static str) -> std::result::Result<T, DeviceError> {
+        self.map_err(|error| DeviceError::Scheduling(format!("{operation}: {error}")))
+    }
 }
