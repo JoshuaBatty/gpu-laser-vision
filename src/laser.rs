@@ -16,7 +16,7 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct EtherDreamStream {
     status: Arc<Mutex<String>>,
     stop_tx: mpsc::Sender<()>,
-    _worker: thread::JoinHandle<()>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl EtherDreamStream {
@@ -34,7 +34,7 @@ impl EtherDreamStream {
         Self {
             status,
             stop_tx,
-            _worker: worker,
+            worker: Some(worker),
         }
     }
 
@@ -50,6 +50,9 @@ impl EtherDreamStream {
 impl Drop for EtherDreamStream {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 

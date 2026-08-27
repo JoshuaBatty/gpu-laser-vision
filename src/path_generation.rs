@@ -51,17 +51,15 @@ struct PixelLine {
     closed: bool,
 }
 
-/// Traces the non-zero pixels in a hysteresis image into ordered vector paths.
-pub fn from_hysteresis(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
+/// Traces the non-zero pixels in a binary edge mask into ordered vector paths.
+pub fn from_edge_mask(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
     let width = image.width() as usize;
     let height = image.height() as usize;
     let active: Vec<_> = image.as_raw().iter().map(|&value| value != 0).collect();
     let mut visited_edges = HashSet::new();
     let mut lines = Vec::new();
     let isolated_pixels: Vec<_> = (0..active.len())
-        .filter(|&pixel| {
-            active[pixel] && neighbors(pixel, width, height, &active).is_empty()
-        })
+        .filter(|&pixel| active[pixel] && neighbors(pixel, width, height, &active).is_empty())
         .collect();
 
     // Trace paths that begin or end at endpoints and junctions first.
@@ -135,10 +133,7 @@ pub fn from_hysteresis(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
             })
             .collect();
 
-        lyon_builder.begin(point(
-            laser_line[0].position[0],
-            laser_line[0].position[1],
-        ));
+        lyon_builder.begin(point(laser_line[0].position[0], laser_line[0].position[1]));
         for laser_point in &laser_line[1..] {
             lyon_builder.line_to(point(laser_point.position[0], laser_point.position[1]));
         }
@@ -176,10 +171,9 @@ fn trace_line(
         if adjacent.len() != 2 {
             break;
         }
-        let Some(next) = adjacent
-            .into_iter()
-            .find(|&candidate| candidate != previous && !visited_edges.contains(&edge(current, candidate)))
-        else {
+        let Some(next) = adjacent.into_iter().find(|&candidate| {
+            candidate != previous && !visited_edges.contains(&edge(current, candidate))
+        }) else {
             break;
         };
         visited_edges.insert(edge(current, next));

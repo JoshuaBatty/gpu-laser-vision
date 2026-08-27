@@ -11,9 +11,6 @@ ncu --set full --kernel-name regex:scharr --launch-count 1 --export target/ncu-s
 | Metric | Baseline |
 |---|---:|
 | Scharr (Systems) | 3.96 us |
-| All kernels | 326 us |
-| 64 hysteresis launches | 313 us |
-| Device-to-host copies | 1.54 ms |
 | Scharr (Compute) | 6.82 us |
 | DRAM / L2 throughput | 21.5% / 55.9% |
 | L1 / L2 hit rate | 51.9% / 39.4% |
