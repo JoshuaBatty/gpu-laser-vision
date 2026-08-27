@@ -1,9 +1,8 @@
-//! Conversion from a thinned edge image into vector and laser paths.
+//! Conversion from a thinned edge image into laser paths.
 
 use std::collections::HashSet;
 
 use image::{GrayImage, RgbImage};
-use nannou::lyon::{math::point, path::Path};
 use nannou_laser::Point as LaserPoint;
 
 const NEIGHBOR_OFFSETS: [(isize, isize); 8] = [
@@ -17,19 +16,13 @@ const NEIGHBOR_OFFSETS: [(isize, isize); 8] = [
     (1, -1),
 ];
 
-/// A Lyon path and the equivalent line sequences accepted by `nannou_laser`.
+/// Point and line sequences accepted by `nannou_laser`.
 pub struct LaserPath {
-    lyon_path: Path,
     laser_points: Vec<LaserPoint>,
     laser_lines: Vec<Vec<LaserPoint>>,
 }
 
 impl LaserPath {
-    /// The vector path used for on-screen rendering.
-    pub fn lyon_path(&self) -> &Path {
-        &self.lyon_path
-    }
-
     /// Isolated points ready to submit with `nannou_laser::Frame::add_points`.
     pub fn laser_points(&self) -> &[LaserPoint] {
         &self.laser_points
@@ -109,7 +102,6 @@ pub fn from_edge_mask(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
         .filter(|line| line.pixels.len() >= if line.closed { 3 } else { 2 })
         .collect();
 
-    let mut lyon_builder = Path::builder();
     let laser_points = isolated_pixels
         .into_iter()
         .map(|pixel| {
@@ -133,12 +125,6 @@ pub fn from_edge_mask(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
             })
             .collect();
 
-        lyon_builder.begin(point(laser_line[0].position[0], laser_line[0].position[1]));
-        for laser_point in &laser_line[1..] {
-            lyon_builder.line_to(point(laser_point.position[0], laser_point.position[1]));
-        }
-        lyon_builder.end(line.closed);
-
         if line.closed {
             laser_line.push(laser_line[0]);
         }
@@ -146,7 +132,6 @@ pub fn from_edge_mask(image: &GrayImage, edge_colors: &RgbImage) -> LaserPath {
     }
 
     LaserPath {
-        lyon_path: lyon_builder.build(),
         laser_points,
         laser_lines,
     }
