@@ -21,9 +21,7 @@ colours, extract contours, and produce normalized paths compatible with
 
 ## Live demo
 
-[Watch the complete 1080p H.264 recording](docs/media/demo.mp4) · 3:01 at 25 FPS,
-captured from the release build with every preview updating on every source
-frame and encoded with HandBrake.
+https://github.com/user-attachments/assets/a6500e34-b6f1-441e-bf42-8834c9743e6e
 
 ## At a glance
 
