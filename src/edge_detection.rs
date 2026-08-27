@@ -17,14 +17,22 @@ pub const DEFAULT_MAX_THRESHOLD: f32 = 1.0;
 pub struct EdgeDetectionImages {
     /// Original colour image supplied to the GPU pipeline.
     pub original: RgbaImage,
+    /// Display-ready images copied from intermediate CUDA buffers.
+    pub previews: EdgeDetectionPreviews,
+    /// Binary laser mask thresholded directly from the Scharr magnitude.
+    pub laser_edges: GrayImage,
+    /// Row-major indices of every non-zero pixel in `laser_edges`.
+    pub edge_pixels: Vec<usize>,
+    /// Original source colours sampled around each final edge on the GPU.
+    pub edge_colors: RgbImage,
+}
+
+/// Host-side preview images copied from intermediate CUDA buffers.
+pub struct EdgeDetectionPreviews {
     /// Grayscale image used as input to the edge detector.
     pub grayscale: GrayImage,
     /// Gradient magnitude produced by the Scharr operator.
     pub edges: GrayImage,
-    /// Binary laser mask thresholded directly from the Scharr magnitude.
-    pub laser_edges: GrayImage,
-    /// Original source colours sampled around each final edge on the GPU.
-    pub edge_colors: RgbImage,
 }
 
 /// Device allocations and CUDA objects referenced by the captured graph.
@@ -53,6 +61,7 @@ struct HostOutputs {
 pub struct CudaEdgeDetector {
     graph: CapturedCudaGraph<EdgeGraphResources>,
     host: HostOutputs,
+    last_thresholds: Option<[f32; 2]>,
     width: u32,
     height: u32,
 }
@@ -74,7 +83,7 @@ pub fn process(path: impl AsRef<Path>) -> Result<EdgeDetectionImages> {
 /// Runs the GPU edge-detection pipeline on an in-memory RGBA image.
 pub fn process_rgba(rgba: RgbaImage) -> Result<EdgeDetectionImages> {
     let mut detector = CudaEdgeDetector::new(rgba.width(), rgba.height())?;
-    detector.process(&rgba, DEFAULT_MIN_THRESHOLD, DEFAULT_MAX_THRESHOLD)
+    detector.process(rgba, DEFAULT_MIN_THRESHOLD, DEFAULT_MAX_THRESHOLD)
 }
 
 impl CudaEdgeDetector {
@@ -172,6 +181,7 @@ impl CudaEdgeDetector {
         Ok(Self {
             graph,
             host,
+            last_thresholds: None,
             width,
             height,
         })
@@ -185,7 +195,7 @@ impl CudaEdgeDetector {
     /// Processes one frame and copies the retained outputs back to the host.
     pub fn process(
         &mut self,
-        rgba: &RgbaImage,
+        rgba: RgbaImage,
         min_threshold: f32,
         max_threshold: f32,
     ) -> Result<EdgeDetectionImages> {
@@ -209,12 +219,15 @@ impl CudaEdgeDetector {
         let thresholds = [min_threshold, max_threshold];
         {
             let resources = self.graph.resources_mut();
-            // SAFETY: the following RGBA upload synchronizes this same stream
-            // before `thresholds` can be dropped or reused.
-            unsafe {
-                resources
-                    .thresholds
-                    .copy_from_host_async_unchecked(&resources.stream, &thresholds)?;
+            if self.last_thresholds != Some(thresholds) {
+                // SAFETY: the following RGBA upload synchronizes this same
+                // stream before `thresholds` can be dropped or reused.
+                unsafe {
+                    resources
+                        .thresholds
+                        .copy_from_host_async_unchecked(&resources.stream, &thresholds)?;
+                }
+                self.last_thresholds = Some(thresholds);
             }
             resources
                 .input_rgba
@@ -234,9 +247,14 @@ impl CudaEdgeDetector {
             .copy_to_pinned_host(&resources.stream, &mut self.host.edge_colors)?;
 
         let mut laser_edges = Vec::with_capacity(self.host.edge_colors.len());
+        let mut edge_pixels = Vec::new();
         let mut edge_colors = Vec::with_capacity(self.host.edge_colors.len() * 3);
-        for color in self.host.edge_colors.iter().copied() {
-            laser_edges.push((color >> 24) as u8);
+        for (pixel, color) in self.host.edge_colors.iter().copied().enumerate() {
+            let edge = (color >> 24) as u8;
+            laser_edges.push(edge);
+            if edge != 0 {
+                edge_pixels.push(pixel);
+            }
             edge_colors.extend_from_slice(&[
                 (color & 0xff) as u8,
                 ((color >> 8) & 0xff) as u8,
@@ -249,15 +267,19 @@ impl CudaEdgeDetector {
                 anyhow::anyhow!("grayscale buffer size does not match image dimensions")
             })
         };
-
-        Ok(EdgeDetectionImages {
+        let previews = EdgeDetectionPreviews {
             grayscale: image(self.host.grayscale.to_vec())?,
             edges: image(self.host.scharr_magnitude.to_vec())?,
+        };
+
+        Ok(EdgeDetectionImages {
+            original: rgba,
+            previews,
             laser_edges: image(laser_edges)?,
+            edge_pixels,
             edge_colors: RgbImage::from_raw(self.width, self.height, edge_colors).ok_or_else(
                 || anyhow::anyhow!("edge-colour buffer size does not match image dimensions"),
             )?,
-            original: rgba.clone(),
         })
     }
 }
