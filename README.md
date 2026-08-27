@@ -159,6 +159,3 @@ The model export workflow uses [Ultralytics YOLO](https://github.com/ultralytics
 and the generated YOLO11 model is subject to Ultralytics' AGPL-3.0 terms unless
 covered by a separate enterprise license. Model weights are not committed.
 
-The bundled fallback video is **Big Buck Bunny**, copyright 2008 Blender
-Foundation, distributed under CC BY 3.0. Full details are in
-[`assets/BIG_BUCK_BUNNY_ATTRIBUTION.md`](assets/BIG_BUCK_BUNNY_ATTRIBUTION.md).
