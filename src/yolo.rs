@@ -11,6 +11,7 @@ use tch::{CModule, Device, IValue, Kind, Tensor};
 const MODEL_IMAGE_SIZE: u32 = 640;
 const PERSON_CLASS_INDEX: i64 = 0;
 const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.25;
+const CONTOUR_COLOR_SEARCH_RADIUS: i32 = 8;
 
 /// Default TorchScript artifact produced by `scripts/export_yolo.py`.
 pub const DEFAULT_MODEL_PATH: &str = "assets/yolo11n-seg.torchscript";
@@ -21,6 +22,8 @@ pub struct YoloFrame {
     pub person_mask: GrayImage,
     /// One-pixel outline extracted from `person_mask`.
     pub contour: GrayImage,
+    /// Source-frame colours retained only along `contour`.
+    pub colored_contour: RgbImage,
     /// Confidence of the selected person detection, if one passed the threshold.
     pub confidence: Option<f32>,
 }
@@ -72,6 +75,7 @@ impl YoloSegmenter {
             prototypes,
             transform,
             self.confidence_threshold,
+            rgba,
         )
     }
 }
@@ -156,6 +160,7 @@ fn decode_person(
     prototypes: Tensor,
     transform: LetterboxTransform,
     confidence_threshold: f32,
+    source: &RgbaImage,
 ) -> Result<YoloFrame> {
     let (batch_size, prediction_channels, candidate_count) = predictions
         .size3()
@@ -207,10 +212,12 @@ fn decode_person(
         transform,
     )?;
     let contour = extract_contour(&person_mask);
+    let colored_contour = colorize_contour(&contour, &person_mask, source);
 
     Ok(YoloFrame {
         person_mask,
         contour,
+        colored_contour,
         confidence: Some(confidence),
     })
 }
@@ -298,10 +305,93 @@ fn extract_contour(mask: &GrayImage) -> GrayImage {
     contour
 }
 
+fn colorize_contour(contour: &GrayImage, person_mask: &GrayImage, source: &RgbaImage) -> RgbImage {
+    debug_assert_eq!(contour.dimensions(), source.dimensions());
+    debug_assert_eq!(person_mask.dimensions(), source.dimensions());
+
+    let mut colors = Vec::with_capacity(contour.as_raw().len() * 3);
+    for y in 0..contour.height() {
+        for x in 0..contour.width() {
+            if contour.get_pixel(x, y)[0] == 0 {
+                colors.extend_from_slice(&[0, 0, 0]);
+                continue;
+            }
+
+            colors.extend_from_slice(&foreground_color(x, y, person_mask, source));
+        }
+    }
+
+    RgbImage::from_raw(contour.width(), contour.height(), colors)
+        .expect("contour and source dimensions were checked")
+}
+
+fn foreground_color(x: u32, y: u32, person_mask: &GrayImage, source: &RgbaImage) -> [u8; 3] {
+    let center = source.get_pixel(x, y).0;
+    let center = [center[0], center[1], center[2]];
+    if !is_green_screen(center) {
+        return center;
+    }
+
+    for radius in 1..=CONTOUR_COLOR_SEARCH_RADIUS {
+        let mut best = None;
+        for offset_y in -radius..=radius {
+            for offset_x in -radius..=radius {
+                if offset_x.abs() != radius && offset_y.abs() != radius {
+                    continue;
+                }
+
+                let candidate_x = x as i32 + offset_x;
+                let candidate_y = y as i32 + offset_y;
+                if candidate_x < 0
+                    || candidate_y < 0
+                    || candidate_x >= source.width() as i32
+                    || candidate_y >= source.height() as i32
+                {
+                    continue;
+                }
+
+                let candidate_x = candidate_x as u32;
+                let candidate_y = candidate_y as u32;
+                if person_mask.get_pixel(candidate_x, candidate_y)[0] == 0 {
+                    continue;
+                }
+
+                let pixel = source.get_pixel(candidate_x, candidate_y).0;
+                let color = [pixel[0], pixel[1], pixel[2]];
+                if is_green_screen(color) {
+                    continue;
+                }
+
+                let score = laser_color_score(color);
+                if best.is_none_or(|(_, best_score)| score > best_score) {
+                    best = Some((color, score));
+                }
+            }
+        }
+
+        if let Some((color, _)) = best {
+            return color;
+        }
+    }
+
+    [0, 0, 0]
+}
+
+fn is_green_screen([red, green, blue]: [u8; 3]) -> bool {
+    green >= 80 && green.saturating_sub(red.max(blue)) >= 35
+}
+
+fn laser_color_score([red, green, blue]: [u8; 3]) -> u16 {
+    let brightest = red.max(green).max(blue);
+    let darkest = red.min(green).min(blue);
+    brightest as u16 * 2 + (brightest - darkest) as u16
+}
+
 fn empty_frame(transform: LetterboxTransform) -> YoloFrame {
     YoloFrame {
         person_mask: GrayImage::new(transform.source_width, transform.source_height),
         contour: GrayImage::new(transform.source_width, transform.source_height),
+        colored_contour: RgbImage::new(transform.source_width, transform.source_height),
         confidence: None,
     }
 }
@@ -315,8 +405,8 @@ fn tensor_output(value: IValue, name: &str) -> Result<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_contour;
-    use image::{GrayImage, Luma};
+    use super::{colorize_contour, extract_contour};
+    use image::{GrayImage, Luma, Rgba, RgbaImage};
 
     #[test]
     fn contour_retains_only_mask_boundary() {
@@ -332,5 +422,29 @@ mod tests {
         assert_eq!(contour.get_pixel(1, 1)[0], 255);
         assert_eq!(contour.get_pixel(3, 2)[0], 255);
         assert_eq!(contour.pixels().filter(|pixel| pixel[0] > 0).count(), 8);
+    }
+
+    #[test]
+    fn colorized_contour_retains_source_colors_only_on_the_outline() {
+        let mut contour = GrayImage::new(2, 1);
+        contour.put_pixel(1, 0, Luma([255]));
+        let source = RgbaImage::from_pixel(2, 1, Rgba([10, 20, 30, 255]));
+
+        let person_mask = GrayImage::from_pixel(2, 1, Luma([255]));
+        let colors = colorize_contour(&contour, &person_mask, &source);
+        assert_eq!(colors.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(colors.get_pixel(1, 0).0, [10, 20, 30]);
+    }
+
+    #[test]
+    fn colorized_contour_replaces_green_spill_with_nearby_foreground() {
+        let mut contour = GrayImage::new(3, 1);
+        contour.put_pixel(1, 0, Luma([255]));
+        let person_mask = GrayImage::from_pixel(3, 1, Luma([255]));
+        let mut source = RgbaImage::from_pixel(3, 1, Rgba([0, 180, 20, 255]));
+        source.put_pixel(2, 0, Rgba([210, 90, 60, 255]));
+
+        let colors = colorize_contour(&contour, &person_mask, &source);
+        assert_eq!(colors.get_pixel(1, 0).0, [210, 90, 60]);
     }
 }
