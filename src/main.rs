@@ -25,7 +25,7 @@ type AppModel = Result<Model, String>;
 
 struct Model {
     panels: Vec<ImagePanel>,
-    laser_path: path_generation::LaserPath,
+    cuda_laser_path: path_generation::LaserPath,
     laser: laser::EtherDreamStream,
     video: Arc<Mutex<VideoBridgeState>>,
     video_label: &'static str,
@@ -35,6 +35,15 @@ struct Model {
 struct ImagePanel {
     label: &'static str,
     image: Handle<Image>,
+}
+
+enum Visualization<'a> {
+    Video,
+    Image(&'a ImagePanel),
+    Laser {
+        label: &'a str,
+        path: &'a path_generation::LaserPath,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -75,8 +84,9 @@ struct VideoVisionPipeline {
 }
 
 struct ProcessedVideoFrame {
-    panels: Vec<ImagePanel>,
-    laser_path: path_generation::LaserPath,
+    panels: [ImagePanel; 6],
+    cuda_laser_path: path_generation::LaserPath,
+    yolo_laser_path: path_generation::LaserPath,
 }
 
 struct VideoBridgePlugin;
@@ -107,8 +117,8 @@ fn model(app: &App) -> AppModel {
         eprintln!("Edge detection failed: {error}");
         error
     })?;
-    let laser_path = path_generation::from_edge_mask(&images.laser_edges, &images.edge_colors);
-    let laser = laser::EtherDreamStream::start(&laser_path);
+    let cuda_laser_path = path_generation::from_edge_mask(&images.laser_edges, &images.edge_colors);
+    let laser = laser::EtherDreamStream::start(&cuda_laser_path);
     let video = Arc::new(Mutex::new(VideoBridgeState::default()));
     let (video_asset_name, video_label) = if app.assets_path().join(PREFERRED_VIDEO_ASSET).is_file()
     {
@@ -134,7 +144,7 @@ fn model(app: &App) -> AppModel {
 
     Ok(Model {
         panels: image_panels(images, upload),
-        laser_path,
+        cuda_laser_path,
         laser,
         video,
         video_label,
@@ -225,10 +235,15 @@ fn process_video_frames(
         let thresholds = lock_video(&bridge.0).thresholds;
         match detector.process(&frame, thresholds.min, thresholds.max) {
             Ok(images) => {
-                let laser_path =
+                let cuda_laser_path =
                     path_generation::from_edge_mask(&images.laser_edges, &images.edge_colors);
+                let yolo_laser_path = path_generation::from_edge_mask(
+                    &yolo_frame.contour,
+                    &yolo_frame.colored_contour,
+                );
                 let mut video = lock_video(&bridge.0);
-                let point_count = laser_path.point_count();
+                let cuda_point_count = cuda_laser_path.point_count();
+                let yolo_point_count = yolo_laser_path.point_count();
                 let upload_debug = if video.processed.is_some() {
                     video.debug_upload_counter += 1;
                     let upload = video.debug_upload_counter >= DEBUG_UPLOAD_INTERVAL;
@@ -244,7 +259,8 @@ fn process_video_frames(
                         processed,
                         images,
                         yolo_frame,
-                        laser_path,
+                        cuda_laser_path,
+                        yolo_laser_path,
                         upload_debug,
                         &mut assets,
                     );
@@ -256,7 +272,11 @@ fn process_video_frames(
                             RenderAssetUsages::default(),
                         ))
                     });
-                    video.processed = Some(ProcessedVideoFrame { panels, laser_path });
+                    video.processed = Some(ProcessedVideoFrame {
+                        panels,
+                        cuda_laser_path,
+                        yolo_laser_path,
+                    });
                 }
                 video.error = None;
                 if !video.reported_first_frame {
@@ -264,7 +284,7 @@ fn process_video_frames(
                         .map(|confidence| format!("person {confidence:.2}"))
                         .unwrap_or_else(|| "no person".into());
                     println!(
-                        "First frame: {:.1} ms ({yolo_ms:.1} ms YOLO, {detection}) | {point_count} laser points",
+                        "First frame: {:.1} ms ({yolo_ms:.1} ms YOLO, {detection}) | CUDA {cuda_point_count} points | YOLO {yolo_point_count} points",
                         frame_started.elapsed().as_secs_f64() * 1_000.0,
                     );
                     video.reported_first_frame = true;
@@ -278,7 +298,7 @@ fn process_video_frames(
                         .map(|confidence| format!("person {confidence:.2}"))
                         .unwrap_or_else(|| "no person".into());
                     println!(
-                        "Pipeline: {:.1} FPS | {yolo_ms:.1} ms YOLO ({detection}) | {point_count} laser points",
+                        "Pipeline: {:.1} FPS | {yolo_ms:.1} ms YOLO ({detection}) | CUDA {cuda_point_count} points | YOLO {yolo_point_count} points",
                         video.processed_frames as f64 / elapsed,
                     );
                     video.fps_window_started = Some(now);
@@ -296,22 +316,24 @@ fn update_processed_frame(
     processed: &mut ProcessedVideoFrame,
     images: edge_detection::EdgeDetectionImages,
     yolo_frame: yolo::YoloFrame,
-    laser_path: path_generation::LaserPath,
+    cuda_laser_path: path_generation::LaserPath,
+    yolo_laser_path: path_generation::LaserPath,
     upload_debug: bool,
     assets: &mut Assets<Image>,
 ) {
-    processed.laser_path = laser_path;
+    processed.cuda_laser_path = cuda_laser_path;
+    processed.yolo_laser_path = yolo_laser_path;
     if !upload_debug {
         return;
     }
 
     let images = [
+        image::DynamicImage::ImageRgb8(images.edge_colors),
+        image::DynamicImage::ImageRgb8(yolo_frame.colored_contour),
         image::DynamicImage::ImageLuma8(yolo_frame.person_mask),
-        image::DynamicImage::ImageLuma8(yolo_frame.contour),
         image::DynamicImage::ImageLuma8(images.grayscale),
         image::DynamicImage::ImageLuma8(images.edges),
         image::DynamicImage::ImageLuma8(images.laser_edges),
-        image::DynamicImage::ImageRgb8(images.edge_colors),
     ];
 
     for (panel, image) in processed.panels.iter_mut().zip(images) {
@@ -356,15 +378,19 @@ fn live_image_panels(
     images: edge_detection::EdgeDetectionImages,
     yolo_frame: yolo::YoloFrame,
     mut upload: impl FnMut(image::DynamicImage) -> Handle<Image>,
-) -> Vec<ImagePanel> {
-    vec![
+) -> [ImagePanel; 6] {
+    [
+        ImagePanel {
+            label: "CUDA colored contour",
+            image: upload(image::DynamicImage::ImageRgb8(images.edge_colors)),
+        },
+        ImagePanel {
+            label: "YOLO colored contour",
+            image: upload(image::DynamicImage::ImageRgb8(yolo_frame.colored_contour)),
+        },
         ImagePanel {
             label: "YOLO person mask",
             image: upload(image::DynamicImage::ImageLuma8(yolo_frame.person_mask)),
-        },
-        ImagePanel {
-            label: "YOLO contour",
-            image: upload(image::DynamicImage::ImageLuma8(yolo_frame.contour)),
         },
         ImagePanel {
             label: "Grayscale",
@@ -375,12 +401,8 @@ fn live_image_panels(
             image: upload(image::DynamicImage::ImageLuma8(images.edges)),
         },
         ImagePanel {
-            label: "Laser edge mask",
+            label: "CUDA edge mask",
             image: upload(image::DynamicImage::ImageLuma8(images.laser_edges)),
-        },
-        ImagePanel {
-            label: "GPU edge colours",
-            image: upload(image::DynamicImage::ImageRgb8(images.edge_colors)),
         },
     ]
 }
@@ -446,13 +468,62 @@ fn view(app: &App, model: &AppModel, window_entity: Entity) {
             }
         });
     let processed = video.processed.as_ref();
-    let panels = processed.map_or(&model.panels, |frame| &frame.panels);
-    let laser_path = processed.map_or(&model.laser_path, |frame| &frame.laser_path);
+    let cuda_laser_path = processed.map_or(&model.cuda_laser_path, |frame| &frame.cuda_laser_path);
+    let cuda_laser_label = format!(
+        "CUDA laser - {} lines / {} points - {}",
+        cuda_laser_path.laser_lines().len(),
+        cuda_laser_path.point_count(),
+        model.laser.status()
+    );
+    let yolo_laser_label = processed.map(|frame| {
+        format!(
+            "YOLO laser - {} lines / {} points",
+            frame.yolo_laser_path.laser_lines().len(),
+            frame.yolo_laser_path.point_count()
+        )
+    });
+    let video_label = video.error.as_deref().unwrap_or(model.video_label);
+    let mut visualizations = vec![Visualization::Video];
+
+    if let Some(frame) = processed {
+        let [
+            cuda_contour,
+            yolo_contour,
+            yolo_mask,
+            grayscale,
+            scharr,
+            cuda_mask,
+        ] = &frame.panels;
+        visualizations.extend([
+            Visualization::Image(cuda_contour),
+            Visualization::Image(yolo_contour),
+            Visualization::Laser {
+                label: &cuda_laser_label,
+                path: &frame.cuda_laser_path,
+            },
+            Visualization::Laser {
+                label: yolo_laser_label
+                    .as_deref()
+                    .expect("live YOLO label was initialized"),
+                path: &frame.yolo_laser_path,
+            },
+            Visualization::Image(yolo_mask),
+            Visualization::Image(grayscale),
+            Visualization::Image(scharr),
+            Visualization::Image(cuda_mask),
+        ]);
+    } else {
+        visualizations.extend(model.panels.iter().map(Visualization::Image));
+        visualizations.push(Visualization::Laser {
+            label: &cuda_laser_label,
+            path: &model.cuda_laser_path,
+        });
+    }
 
     let margin = 24.0;
     let gap = 18.0;
     let label_height = 30.0;
-    let panel_count = panels.len() + 2;
+    let panel_count = visualizations.len();
     let row_count = panel_count.div_ceil(COLUMNS);
     let content_width = (window.w() - CONTROL_PANEL_WIDTH).max(1.0);
     let content_center_x = window.left() + CONTROL_PANEL_WIDTH + content_width * 0.5;
@@ -461,15 +532,7 @@ fn view(app: &App, model: &AppModel, window_entity: Entity) {
         / row_count as f32)
         .max(1.0);
     let image_size = cell_width.min(cell_height - label_height - 12.0).max(1.0);
-    let laser_path_label = format!(
-        "Laser - {} lines / {} points - {}",
-        laser_path.laser_lines().len(),
-        laser_path.point_count(),
-        model.laser.status()
-    );
-    let video_label = video.error.as_deref().unwrap_or(model.video_label);
-
-    for index in 0..panel_count {
+    for (index, visualization) in visualizations.iter().enumerate() {
         let row = index / COLUMNS;
         let column = index % COLUMNS;
         let items_in_row = (panel_count - row * COLUMNS).min(COLUMNS);
@@ -486,73 +549,75 @@ fn view(app: &App, model: &AppModel, window_entity: Entity) {
             .x_y(x, cell_y)
             .w_h(cell_width, cell_height)
             .color(Color::srgb_u8(24, 28, 31));
-        let label = if index == 0 {
-            video_label
-        } else {
-            panels
-                .get(index - 1)
-                .map_or(laser_path_label.as_str(), |panel| panel.label)
+        let label = match visualization {
+            Visualization::Video => video_label,
+            Visualization::Image(panel) => panel.label,
+            Visualization::Laser { label, .. } => label,
         };
         draw.text(label)
             .x_y(x, cell_top - label_height * 0.5)
             .font_size(16)
             .color(Color::srgb_u8(210, 216, 220));
 
-        if index == 0 {
-            if let Some(image) = &video.image {
-                let video_width = cell_width.min(image_size * 16.0 / 9.0);
-                draw.rect()
-                    .x_y(x, image_y)
-                    .w_h(video_width, video_width * 9.0 / 16.0)
-                    .color(WHITE)
-                    .texture(image);
-            }
-        } else if let Some(panel) = panels.get(index - 1) {
-            draw.rect()
-                .x_y(x, image_y)
-                .w_h(image_size, image_size)
-                .color(WHITE)
-                .texture(&panel.image);
-        } else {
-            let scale = image_size * 0.5;
-            draw.x_y(x, image_y)
-                .scale(scale)
-                .path()
-                .stroke()
-                .weight(1.0)
-                .color(Color::srgb_u8(40, 52, 49))
-                .events(laser_path.lyon_path().iter());
-            for line in laser_path.laser_lines() {
-                for segment in line.windows(2) {
-                    let start = segment[0];
-                    let end = segment[1];
-                    let color = [
-                        (start.color[0] + end.color[0]) * 0.5,
-                        (start.color[1] + end.color[1]) * 0.5,
-                        (start.color[2] + end.color[2]) * 0.5,
-                    ];
-                    draw.line()
-                        .start(pt2(
-                            x + start.position[0] * scale,
-                            image_y + start.position[1] * scale,
-                        ))
-                        .end(pt2(
-                            x + end.position[0] * scale,
-                            image_y + end.position[1] * scale,
-                        ))
-                        .weight(1.0)
-                        .color(Color::srgb(color[0], color[1], color[2]));
+        match visualization {
+            Visualization::Video => {
+                if let Some(image) = &video.image {
+                    let video_width = cell_width.min(image_size * 16.0 / 9.0);
+                    draw.rect()
+                        .x_y(x, image_y)
+                        .w_h(video_width, video_width * 9.0 / 16.0)
+                        .color(WHITE)
+                        .texture(image);
                 }
             }
-            for point in laser_path.laser_points() {
-                draw.ellipse()
-                    .x_y(
-                        x + point.position[0] * scale,
-                        image_y + point.position[1] * scale,
-                    )
-                    .radius(1.0)
-                    .color(Color::srgb(point.color[0], point.color[1], point.color[2]));
+            Visualization::Image(panel) => {
+                draw.rect()
+                    .x_y(x, image_y)
+                    .w_h(image_size, image_size)
+                    .color(WHITE)
+                    .texture(&panel.image);
+            }
+            Visualization::Laser { path, .. } => {
+                draw_laser_path(&draw, path, x, image_y, image_size * 0.5);
             }
         }
+    }
+}
+
+fn draw_laser_path(
+    draw: &Draw,
+    laser_path: &path_generation::LaserPath,
+    x: f32,
+    y: f32,
+    scale: f32,
+) {
+    for line in laser_path.laser_lines() {
+        for segment in line.windows(2) {
+            let start = segment[0];
+            let end = segment[1];
+            let color = [
+                (start.color[0] + end.color[0]) * 0.5,
+                (start.color[1] + end.color[1]) * 0.5,
+                (start.color[2] + end.color[2]) * 0.5,
+            ];
+            draw.line()
+                .start(pt2(
+                    x + start.position[0] * scale,
+                    y + start.position[1] * scale,
+                ))
+                .end(pt2(
+                    x + end.position[0] * scale,
+                    y + end.position[1] * scale,
+                ))
+                .weight(1.0)
+                .color(Color::srgb(color[0], color[1], color[2]));
+        }
+    }
+
+    for point in laser_path.laser_points() {
+        draw.ellipse()
+            .x_y(x + point.position[0] * scale, y + point.position[1] * scale)
+            .radius(1.0)
+            .color(Color::srgb(point.color[0], point.color[1], point.color[2]));
     }
 }
