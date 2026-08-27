@@ -7,19 +7,23 @@ use cuda_core::{CudaContext, CudaStream};
 use cutile_cuda_async::{cuda_graph::CudaGraph, device_operation::DeviceOp, error::DeviceError};
 use cutile_cuda_core::{Device, Stream};
 
-/// A captured cuTile graph backed by a cuda-oxide context and stream.
-pub(crate) struct CapturedCudaGraph {
+/// A captured cuTile graph and the resources referenced by its nodes.
+///
+/// Field order is intentional: the graph and borrowed stream are destroyed
+/// before the resource payload that owns their modules and device pointers.
+pub(crate) struct CapturedCudaGraph<R> {
     graph: CudaGraph<()>,
     stream: Arc<Stream>,
-    _device: Arc<Device>,
+    resources: R,
 }
 
-impl CapturedCudaGraph {
-    /// Borrows cuda-oxide handles while retaining their owning `Arc`s.
+impl<R> CapturedCudaGraph<R> {
+    /// Captures work against `resources` and retains them for the graph's lifetime.
     pub(crate) fn capture(
         context: Arc<CudaContext>,
         stream: Arc<CudaStream>,
-        capture: impl FnOnce() -> Result<(), DeviceError>,
+        mut resources: R,
+        capture: impl FnOnce(&mut R) -> Result<(), DeviceError>,
     ) -> Result<Self> {
         // SAFETY: cuTile retains the context owner and never destroys the borrowed handle.
         let device = unsafe {
@@ -34,13 +38,19 @@ impl CapturedCudaGraph {
         let stream = unsafe {
             Stream::borrow_with_owner(stream.cu_stream().cast::<c_void>(), &device, stream)
         };
-        let graph = CudaGraph::scope(&stream, |_| capture()).context("capturing CUDA graph")?;
+        let graph = CudaGraph::scope(&stream, |_| capture(&mut resources))
+            .context("capturing CUDA graph")?;
 
         Ok(Self {
             graph,
             stream,
-            _device: device,
+            resources,
         })
+    }
+
+    /// Returns the resources owned by the captured graph.
+    pub(crate) fn resources_mut(&mut self) -> &mut R {
+        &mut self.resources
     }
 
     /// Launches the graph and waits for its root stream to complete.
