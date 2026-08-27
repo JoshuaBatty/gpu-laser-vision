@@ -21,10 +21,11 @@ colours, extract contours, and produce normalized paths compatible with
 
 ## Live demo
 
-![Live CUDA and YOLO pipeline](docs/media/demo.gif)
+[![Eight-second 1080p preview of the live CUDA and YOLO pipeline](docs/media/demo.gif)](docs/media/demo.mp4)
 
-[Download the 720p H.264 recording](docs/media/demo.mp4) · Captured from the
-release build with every preview updating on every source frame.
+[Watch the complete 1080p H.264 recording](docs/media/demo.mp4) · 3:01 at 25 FPS,
+captured from the release build with every preview updating on every source
+frame and encoded with HandBrake.
 
 ## At a glance
 
