@@ -1,5 +1,6 @@
 mod cuda_graph;
 mod edge_detection;
+mod interface;
 mod kernels;
 mod laser;
 mod path_generation;
@@ -17,13 +18,11 @@ use std::{
 const SOURCE_IMAGE: &str = "assets/test_tiles.png";
 const PREFERRED_VIDEO_ASSET: &str = "jcvd_green_screen_720p.mp4";
 const FALLBACK_VIDEO_ASSET: &str = "big_buck_bunny_720p.mp4";
-const COLUMNS: usize = 3;
-const CONTROL_PANEL_WIDTH: f32 = 220.0;
-
+const PRESENTATION_WIDTH: u32 = 1280;
+const PRESENTATION_HEIGHT: u32 = 720;
 type AppModel = Result<Model, String>;
 
 struct Model {
-    panels: Vec<ImagePanel>,
     cuda_laser_path: path_generation::LaserPath,
     laser: laser::EtherDreamStream,
     video: Arc<Mutex<VideoBridgeState>>,
@@ -32,17 +31,7 @@ struct Model {
 
 #[derive(Clone)]
 struct ImagePanel {
-    label: &'static str,
     image: Handle<Image>,
-}
-
-enum Visualization<'a> {
-    Video,
-    Image(&'a ImagePanel),
-    Laser {
-        label: &'a str,
-        path: &'a path_generation::LaserPath,
-    },
 }
 
 #[derive(Clone, Copy)]
@@ -89,6 +78,13 @@ impl PipelineTimingSample {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct PipelineMetrics {
+    fps: f64,
+    timings: PipelineTimingSample,
+    yolo_confidence: Option<f32>,
+}
+
 impl Default for EdgeThresholds {
     fn default() -> Self {
         Self {
@@ -110,6 +106,8 @@ struct VideoBridgeState {
     fps_window_started: Option<Instant>,
     processed_frames: u64,
     timing_totals: PipelineTimingSample,
+    metrics: PipelineMetrics,
+    interface_configured: bool,
     reported_first_frame: bool,
     thresholds: EdgeThresholds,
 }
@@ -143,9 +141,8 @@ fn main() {
 }
 
 fn model(app: &App) -> AppModel {
-    let (width, height) = image::image_dimensions(SOURCE_IMAGE).unwrap_or((800, 800));
     app.new_window::<AppModel>()
-        .size(width, height)
+        .size(PRESENTATION_WIDTH, PRESENTATION_HEIGHT)
         .title("GPU Laser Vision")
         .build();
 
@@ -178,13 +175,7 @@ fn model(app: &App) -> AppModel {
         }
     });
 
-    let upload = |image| {
-        let image = Image::from_dynamic(image, true, RenderAssetUsages::default());
-        app.asset_server().add(image)
-    };
-
     Ok(Model {
-        panels: image_panels(images, upload),
         cuda_laser_path,
         laser,
         video,
@@ -357,6 +348,12 @@ fn process_video_frames(
                         video.processed_frames as f64 / elapsed,
                     );
                     let average = video.timing_totals.averaged_over(video.processed_frames);
+                    let fps = video.processed_frames as f64 / elapsed;
+                    video.metrics = PipelineMetrics {
+                        fps,
+                        timings: average,
+                        yolo_confidence,
+                    };
                     println!(
                         "Stages: {:.1} total | {:.1} YOLO | {:.1} CUDA edges | {:.1} CUDA path | {:.1} YOLO path | {:.1} frame copy | {:.1} debug upload ms",
                         average.total_ms,
@@ -445,35 +442,6 @@ fn update_luma_panel(panel: &mut ImagePanel, image: image::GrayImage, assets: &m
     ));
 }
 
-fn image_panels(
-    images: edge_detection::EdgeDetectionImages,
-    mut upload: impl FnMut(image::DynamicImage) -> Handle<Image>,
-) -> Vec<ImagePanel> {
-    let previews = images.previews;
-    vec![
-        ImagePanel {
-            label: "Original",
-            image: upload(image::DynamicImage::ImageRgba8(images.original)),
-        },
-        ImagePanel {
-            label: "Grayscale",
-            image: upload(image::DynamicImage::ImageLuma8(previews.grayscale)),
-        },
-        ImagePanel {
-            label: "Scharr magnitude",
-            image: upload(image::DynamicImage::ImageLuma8(previews.edges)),
-        },
-        ImagePanel {
-            label: "Laser edge mask",
-            image: upload(image::DynamicImage::ImageLuma8(images.laser_edges)),
-        },
-        ImagePanel {
-            label: "GPU edge colours",
-            image: upload(image::DynamicImage::ImageRgb8(images.edge_colors)),
-        },
-    ]
-}
-
 fn live_image_panels(
     images: edge_detection::EdgeDetectionImages,
     yolo_frame: yolo::YoloFrame,
@@ -482,27 +450,21 @@ fn live_image_panels(
     let previews = images.previews;
     [
         ImagePanel {
-            label: "CUDA colored contour",
             image: upload(image::DynamicImage::ImageRgb8(images.edge_colors)),
         },
         ImagePanel {
-            label: "YOLO colored contour",
             image: upload(image::DynamicImage::ImageRgb8(yolo_frame.colored_contour)),
         },
         ImagePanel {
-            label: "YOLO person mask",
             image: upload(image::DynamicImage::ImageLuma8(yolo_frame.person_mask)),
         },
         ImagePanel {
-            label: "Grayscale",
             image: upload(image::DynamicImage::ImageLuma8(previews.grayscale)),
         },
         ImagePanel {
-            label: "Scharr magnitude",
             image: upload(image::DynamicImage::ImageLuma8(previews.edges)),
         },
         ImagePanel {
-            label: "CUDA edge mask",
             image: upload(image::DynamicImage::ImageLuma8(images.laser_edges)),
         },
     ]
@@ -517,7 +479,7 @@ fn lock_video(video: &Mutex<VideoBridgeState>) -> MutexGuard<'_, VideoBridgeStat
 fn view(app: &App, model: &AppModel, window_entity: Entity) {
     let draw = app.draw();
     let window = app.window_rect();
-    draw.background().color(Color::srgb_u8(12, 14, 16));
+    draw.background().color(interface::background());
 
     let model = match model {
         Ok(model) => model,
@@ -534,59 +496,64 @@ fn view(app: &App, model: &AppModel, window_entity: Entity) {
         }
     };
     let mut video = lock_video(&model.video);
+    let laser_status = model.laser.status();
+    let laser_accent = status_accent(&laser_status);
     let egui_context = app.egui_for_window(window_entity);
+    if !video.interface_configured {
+        interface::configure_egui(&egui_context);
+        video.interface_configured = true;
+    }
     let mut egui_viewport = egui::Ui::new(
         egui_context.clone(),
-        "edge_threshold_viewport".into(),
+        "dashboard_viewport".into(),
         egui::UiBuilder::new()
             .layer_id(egui::LayerId::background())
             .max_rect(egui_context.viewport_rect()),
     );
-    egui::Panel::left("edge_threshold_controls")
-        .exact_size(CONTROL_PANEL_WIDTH)
+
+    egui::Panel::top("app_header")
+        .exact_size(interface::HEADER_HEIGHT)
         .resizable(false)
+        .frame(interface::header_frame())
         .show_inside(&mut egui_viewport, |ui| {
-            ui.heading("Edge thresholds");
-            ui.label("Normalized Scharr magnitude");
-            ui.add_space(8.0);
-
-            let mut min = video.thresholds.min;
-            let mut max = video.thresholds.max;
-            ui.add(
-                egui::Slider::new(&mut min, 0.0..=max)
-                    .text("Min")
-                    .fixed_decimals(3),
-            );
-            ui.add(
-                egui::Slider::new(&mut max, min..=1.0)
-                    .text("Max")
-                    .fixed_decimals(3),
-            );
-            video.thresholds = EdgeThresholds { min, max };
-
-            if ui.button("Reset").clicked() {
-                video.thresholds = EdgeThresholds::default();
-            }
+            draw_header(ui, video.metrics, &laser_status, laser_accent);
         });
-    let processed = video.processed.as_ref();
-    let cuda_laser_path = processed.map_or(&model.cuda_laser_path, |frame| &frame.cuda_laser_path);
-    let cuda_laser_label = format!(
-        "CUDA laser - {} lines / {} points - {}",
-        cuda_laser_path.laser_lines().len(),
-        cuda_laser_path.point_count(),
-        model.laser.status()
-    );
-    let yolo_laser_label = processed.map(|frame| {
-        format!(
-            "YOLO laser - {} lines / {} points",
-            frame.yolo_laser_path.laser_lines().len(),
-            frame.yolo_laser_path.point_count()
-        )
-    });
-    let video_label = video.error.as_deref().unwrap_or(model.video_label);
-    let mut visualizations = vec![Visualization::Video];
 
-    if let Some(frame) = processed {
+    egui::Panel::left("control_rail")
+        .exact_size(interface::SIDEBAR_WIDTH)
+        .resizable(false)
+        .frame(interface::sidebar_frame())
+        .show_inside(&mut egui_viewport, |ui| {
+            draw_control_rail(ui, &mut video, model.video_label, &laser_status);
+        });
+
+    let layout = interface::DashboardLayout::new(window);
+    let source_meta = if video.error.is_some() {
+        "SOURCE ERROR"
+    } else if video.image.is_some() {
+        "LIVE · 1280 × 720"
+    } else {
+        "CONNECTING"
+    };
+    let source_media = interface::draw_card_shell(
+        &draw,
+        layout.hero[0],
+        "SOURCE",
+        "INPUT VIDEO",
+        source_meta,
+        if video.error.is_some() {
+            interface::Accent::Error
+        } else {
+            interface::Accent::Neutral
+        },
+    );
+    if let Some(image) = &video.image {
+        interface::draw_texture(&draw, image, source_media);
+    } else {
+        interface::draw_empty_state(&draw, source_media, "WAITING FOR VIDEO");
+    }
+
+    if let Some(frame) = video.processed.as_ref() {
         let [
             cuda_contour,
             yolo_contour,
@@ -595,103 +562,344 @@ fn view(app: &App, model: &AppModel, window_entity: Entity) {
             scharr,
             cuda_mask,
         ] = &frame.panels;
-        visualizations.extend([
-            Visualization::Image(cuda_contour),
-            Visualization::Image(yolo_contour),
-            Visualization::Laser {
-                label: &cuda_laser_label,
-                path: &frame.cuda_laser_path,
-            },
-            Visualization::Laser {
-                label: yolo_laser_label
-                    .as_deref()
-                    .expect("live YOLO label was initialized"),
-                path: &frame.yolo_laser_path,
-            },
-            Visualization::Image(yolo_mask),
-            Visualization::Image(grayscale),
-            Visualization::Image(scharr),
-            Visualization::Image(cuda_mask),
-        ]);
+
+        let cuda_contour_media = interface::draw_card_shell(
+            &draw,
+            layout.hero[1],
+            "CUDA",
+            "COLORED CONTOUR",
+            &format!("{} PTS", frame.cuda_laser_path.point_count()),
+            interface::Accent::Cuda,
+        );
+        interface::draw_texture(&draw, &cuda_contour.image, cuda_contour_media);
+
+        let confidence = video
+            .metrics
+            .yolo_confidence
+            .map(|value| format!("{:.0}% PERSON", value * 100.0))
+            .unwrap_or_else(|| "SEARCHING".into());
+        let yolo_contour_media = interface::draw_card_shell(
+            &draw,
+            layout.hero[2],
+            "YOLO",
+            "COLORED CONTOUR",
+            &confidence,
+            interface::Accent::Yolo,
+        );
+        interface::draw_texture(&draw, &yolo_contour.image, yolo_contour_media);
+
+        let cuda_laser_meta = format!(
+            "{} LINES · {} PTS",
+            frame.cuda_laser_path.laser_lines().len(),
+            frame.cuda_laser_path.point_count()
+        );
+        let cuda_laser_media = interface::draw_card_shell(
+            &draw,
+            layout.outputs[0],
+            "CUDA OUTPUT",
+            "LASER PREVIEW",
+            &cuda_laser_meta,
+            interface::Accent::Cuda,
+        );
+        draw_laser_path(&draw, &frame.cuda_laser_path, cuda_laser_media);
+
+        let yolo_laser_meta = format!(
+            "{} LINES · {} PTS",
+            frame.yolo_laser_path.laser_lines().len(),
+            frame.yolo_laser_path.point_count()
+        );
+        let yolo_laser_media = interface::draw_card_shell(
+            &draw,
+            layout.outputs[1],
+            "YOLO OUTPUT",
+            "LASER PREVIEW",
+            &yolo_laser_meta,
+            interface::Accent::Yolo,
+        );
+        draw_laser_path(&draw, &frame.yolo_laser_path, yolo_laser_media);
+
+        for (card, eyebrow, title, panel) in [
+            (layout.diagnostics[0], "CUDA STAGE", "GRAYSCALE", grayscale),
+            (layout.diagnostics[1], "CUDA STAGE", "SCHARR", scharr),
+            (layout.diagnostics[2], "CUDA STAGE", "EDGE MASK", cuda_mask),
+            (
+                layout.diagnostics[3],
+                "YOLO STAGE",
+                "PERSON MASK",
+                yolo_mask,
+            ),
+        ] {
+            let media = interface::draw_card_shell(
+                &draw,
+                card,
+                eyebrow,
+                title,
+                "",
+                interface::Accent::Diagnostic,
+            );
+            interface::draw_texture(&draw, &panel.image, media);
+        }
     } else {
-        visualizations.extend(model.panels.iter().map(Visualization::Image));
-        visualizations.push(Visualization::Laser {
-            label: &cuda_laser_label,
-            path: &model.cuda_laser_path,
+        draw_loading_dashboard(&draw, &layout, &model.cuda_laser_path);
+    }
+}
+
+fn draw_header(
+    ui: &mut egui::Ui,
+    metrics: PipelineMetrics,
+    laser_status: &str,
+    laser_accent: interface::Accent,
+) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new("GPU LASER VISION")
+                    .size(18.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(236, 240, 242)),
+            );
+            ui.label(
+                egui::RichText::new("REAL-TIME CUDA + YOLO SEGMENTATION PIPELINE")
+                    .size(9.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(105, 119, 130)),
+            );
         });
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            interface::status_chip(ui, "LASER", laser_status, laser_accent);
+            let yolo = metrics
+                .yolo_confidence
+                .map(|value| format!("{:.0}%", value * 100.0))
+                .unwrap_or_else(|| "WARMING".into());
+            interface::status_chip(ui, "YOLO", &yolo, interface::Accent::Yolo);
+            interface::status_chip(ui, "CUDA", "GRAPH", interface::Accent::Cuda);
+            let fps = if metrics.fps > 0.0 {
+                format!("{:.0} FPS", metrics.fps)
+            } else {
+                "-- FPS".into()
+            };
+            interface::status_chip(ui, "PIPELINE", &fps, interface::Accent::Neutral);
+        });
+    });
+}
+
+fn draw_control_rail(
+    ui: &mut egui::Ui,
+    video: &mut VideoBridgeState,
+    video_label: &str,
+    laser_status: &str,
+) {
+    ui.spacing_mut().item_spacing.y = 4.0;
+    interface::section_label(ui, "VISION CONTROLS");
+    ui.add_space(3.0);
+    ui.label(egui::RichText::new("Edge thresholds").size(16.0).strong());
+    ui.label(
+        egui::RichText::new("Normalized Scharr magnitude")
+            .size(11.0)
+            .color(egui::Color32::from_rgb(121, 134, 144)),
+    );
+    ui.add_space(8.0);
+
+    let mut min = video.thresholds.min;
+    let mut max = video.thresholds.max;
+    interface::metric_row(
+        ui,
+        "MIN THRESHOLD",
+        egui::RichText::new(format!("{min:.3}"))
+            .strong()
+            .color(interface::Accent::Cuda.ui_color()),
+    );
+    ui.add(egui::Slider::new(&mut min, 0.0..=max).show_value(false));
+    interface::metric_row(
+        ui,
+        "MAX THRESHOLD",
+        egui::RichText::new(format!("{max:.3}"))
+            .strong()
+            .color(interface::Accent::Cuda.ui_color()),
+    );
+    ui.add(egui::Slider::new(&mut max, min..=1.0).show_value(false));
+    video.thresholds = EdgeThresholds { min, max };
+
+    ui.add_space(4.0);
+    if ui.button("Reset thresholds").clicked() {
+        video.thresholds = EdgeThresholds::default();
     }
 
-    let margin = 24.0;
-    let gap = 18.0;
-    let label_height = 30.0;
-    let panel_count = visualizations.len();
-    let row_count = panel_count.div_ceil(COLUMNS);
-    let content_width = (window.w() - CONTROL_PANEL_WIDTH).max(1.0);
-    let content_center_x = window.left() + CONTROL_PANEL_WIDTH + content_width * 0.5;
-    let cell_width = ((content_width - margin * 2.0 - gap * 2.0) / COLUMNS as f32).max(1.0);
-    let cell_height = ((window.h() - margin * 2.0 - gap * row_count.saturating_sub(1) as f32)
-        / row_count as f32)
-        .max(1.0);
-    let image_size = cell_width.min(cell_height - label_height - 12.0).max(1.0);
-    for (index, visualization) in visualizations.iter().enumerate() {
-        let row = index / COLUMNS;
-        let column = index % COLUMNS;
-        let items_in_row = (panel_count - row * COLUMNS).min(COLUMNS);
-        let row_width =
-            items_in_row as f32 * cell_width + items_in_row.saturating_sub(1) as f32 * gap;
-        let x = content_center_x - row_width * 0.5
-            + cell_width * 0.5
-            + column as f32 * (cell_width + gap);
-        let cell_top = window.top() - margin - row as f32 * (cell_height + gap);
-        let cell_y = cell_top - cell_height * 0.5;
-        let image_y = cell_top - label_height - 8.0 - image_size * 0.5;
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(10.0);
+    interface::section_label(ui, "PIPELINE");
+    ui.add_space(4.0);
+    let ready = video.processed.is_some();
+    interface::metric_row(
+        ui,
+        "CUDA GRAPH",
+        state_text(
+            if ready { "READY" } else { "WARMING" },
+            interface::Accent::Cuda,
+        ),
+    );
+    interface::metric_row(
+        ui,
+        "YOLO RTX",
+        state_text(
+            if ready { "ACTIVE" } else { "LOADING" },
+            interface::Accent::Yolo,
+        ),
+    );
+    interface::metric_row(
+        ui,
+        "LASER",
+        state_text(laser_status, status_accent(laser_status)),
+    );
 
-        draw.rect()
-            .x_y(x, cell_y)
-            .w_h(cell_width, cell_height)
-            .color(Color::srgb_u8(24, 28, 31));
-        let label = match visualization {
-            Visualization::Video => video_label,
-            Visualization::Image(panel) => panel.label,
-            Visualization::Laser { label, .. } => label,
-        };
-        draw.text(label)
-            .x_y(x, cell_top - label_height * 0.5)
-            .font_size(16)
-            .color(Color::srgb_u8(210, 216, 220));
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(10.0);
+    interface::section_label(ui, "PERFORMANCE");
+    ui.add_space(4.0);
+    let timings = video.metrics.timings;
+    interface::metric_row(ui, "FRAME RATE", format_fps(video.metrics.fps));
+    interface::metric_row(ui, "TOTAL", format_ms(timings.total_ms));
+    interface::metric_row(ui, "YOLO", format_ms(timings.yolo_ms));
+    interface::metric_row(ui, "CUDA EDGES", format_ms(timings.cuda_edges_ms));
+    interface::metric_row(
+        ui,
+        "PATH BUILD",
+        format_ms(timings.cuda_path_ms + timings.yolo_path_ms),
+    );
+    interface::metric_row(ui, "TEXTURE UPLOAD", format_ms(timings.debug_upload_ms));
 
-        match visualization {
-            Visualization::Video => {
-                if let Some(image) = &video.image {
-                    let video_width = cell_width.min(image_size * 16.0 / 9.0);
-                    draw.rect()
-                        .x_y(x, image_y)
-                        .w_h(video_width, video_width * 9.0 / 16.0)
-                        .color(WHITE)
-                        .texture(image);
-                }
-            }
-            Visualization::Image(panel) => {
-                draw.rect()
-                    .x_y(x, image_y)
-                    .w_h(image_size, image_size)
-                    .color(WHITE)
-                    .texture(&panel.image);
-            }
-            Visualization::Laser { path, .. } => {
-                draw_laser_path(&draw, path, x, image_y, image_size * 0.5);
-            }
-        }
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(10.0);
+    interface::section_label(ui, "SOURCE");
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(video_label)
+            .size(12.0)
+            .color(egui::Color32::from_rgb(188, 197, 203)),
+    );
+    ui.label(
+        egui::RichText::new("1280 × 720 · LOOP")
+            .size(10.0)
+            .strong()
+            .color(egui::Color32::from_rgb(103, 117, 127)),
+    );
+
+    if let Some(error) = &video.error {
+        ui.add_space(14.0);
+        interface::section_label(ui, "PIPELINE ERROR");
+        ui.label(
+            egui::RichText::new(error)
+                .size(10.0)
+                .color(interface::Accent::Error.ui_color()),
+        );
+    }
+}
+
+fn draw_loading_dashboard(
+    draw: &Draw,
+    layout: &interface::DashboardLayout,
+    fallback_laser_path: &path_generation::LaserPath,
+) {
+    for (card, eyebrow, title, accent) in [
+        (
+            layout.hero[1],
+            "CUDA",
+            "COLORED CONTOUR",
+            interface::Accent::Cuda,
+        ),
+        (
+            layout.hero[2],
+            "YOLO",
+            "COLORED CONTOUR",
+            interface::Accent::Yolo,
+        ),
+    ] {
+        let media = interface::draw_card_shell(draw, card, eyebrow, title, "WARMING", accent);
+        interface::draw_empty_state(draw, media, "INITIALIZING PIPELINE");
+    }
+
+    let cuda_media = interface::draw_card_shell(
+        draw,
+        layout.outputs[0],
+        "CUDA OUTPUT",
+        "LASER PREVIEW",
+        "WARMING",
+        interface::Accent::Cuda,
+    );
+    draw_laser_path(draw, fallback_laser_path, cuda_media);
+    let yolo_media = interface::draw_card_shell(
+        draw,
+        layout.outputs[1],
+        "YOLO OUTPUT",
+        "LASER PREVIEW",
+        "WARMING",
+        interface::Accent::Yolo,
+    );
+    interface::draw_empty_state(draw, yolo_media, "AWAITING SEGMENTATION");
+
+    for (card, eyebrow, title) in [
+        (layout.diagnostics[0], "CUDA STAGE", "GRAYSCALE"),
+        (layout.diagnostics[1], "CUDA STAGE", "SCHARR"),
+        (layout.diagnostics[2], "CUDA STAGE", "EDGE MASK"),
+        (layout.diagnostics[3], "YOLO STAGE", "PERSON MASK"),
+    ] {
+        let media = interface::draw_card_shell(
+            draw,
+            card,
+            eyebrow,
+            title,
+            "",
+            interface::Accent::Diagnostic,
+        );
+        interface::draw_empty_state(draw, media, "WAITING");
+    }
+}
+
+fn status_accent(status: &str) -> interface::Accent {
+    let status = status.to_ascii_lowercase();
+    if status.contains("stream") || status.contains("ready") {
+        interface::Accent::Yolo
+    } else if status.contains("error") || status.contains("failed") {
+        interface::Accent::Error
+    } else {
+        interface::Accent::Neutral
+    }
+}
+
+fn state_text(value: &str, accent: interface::Accent) -> egui::RichText {
+    egui::RichText::new(value.to_ascii_uppercase())
+        .size(10.0)
+        .strong()
+        .color(accent.ui_color())
+}
+
+fn format_ms(value: f64) -> String {
+    if value > 0.0 {
+        format!("{value:.1} ms")
+    } else {
+        "--".into()
+    }
+}
+
+fn format_fps(value: f64) -> String {
+    if value > 0.0 {
+        format!("{value:.1} FPS")
+    } else {
+        "--".into()
     }
 }
 
 fn draw_laser_path(
     draw: &Draw,
     laser_path: &path_generation::LaserPath,
-    x: f32,
-    y: f32,
-    scale: f32,
+    media: interface::CardRect,
 ) {
+    let x_scale = media.width * 0.5;
+    let y_scale = media.height * 0.5;
     for line in laser_path.laser_lines() {
         for segment in line.windows(2) {
             let start = segment[0];
@@ -703,21 +911,24 @@ fn draw_laser_path(
             ];
             draw.line()
                 .start(pt2(
-                    x + start.position[0] * scale,
-                    y + start.position[1] * scale,
+                    media.x + start.position[0] * x_scale,
+                    media.y + start.position[1] * y_scale,
                 ))
                 .end(pt2(
-                    x + end.position[0] * scale,
-                    y + end.position[1] * scale,
+                    media.x + end.position[0] * x_scale,
+                    media.y + end.position[1] * y_scale,
                 ))
-                .weight(1.0)
+                .weight(1.1)
                 .color(Color::srgb(color[0], color[1], color[2]));
         }
     }
 
     for point in laser_path.laser_points() {
         draw.ellipse()
-            .x_y(x + point.position[0] * scale, y + point.position[1] * scale)
+            .x_y(
+                media.x + point.position[0] * x_scale,
+                media.y + point.position[1] * y_scale,
+            )
             .radius(1.0)
             .color(Color::srgb(point.color[0], point.color[1], point.color[2]));
     }
