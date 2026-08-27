@@ -21,8 +21,7 @@ use std::{
 };
 
 const SOURCE_IMAGE: &str = "assets/test_tiles.png";
-const PREFERRED_VIDEO_ASSET: &str = "jcvd_green_screen_720p.mp4";
-const FALLBACK_VIDEO_ASSET: &str = "big_buck_bunny_720p.mp4";
+const VIDEO_ASSET: &str = "jcvd_green_screen_720p.mp4";
 const PRESENTATION_WIDTH: u32 = 1280;
 const PRESENTATION_HEIGHT: u32 = 720;
 type AppModel = Result<Model, String>;
@@ -172,13 +171,7 @@ fn model(app: &App) -> AppModel {
     );
     let laser = laser::EtherDreamStream::start(&cuda_laser_path);
     let video = Arc::new(Mutex::new(VideoBridgeState::default()));
-    let (video_asset_name, video_label) = if app.assets_path().join(PREFERRED_VIDEO_ASSET).is_file()
-    {
-        (PREFERRED_VIDEO_ASSET, "JCVD green screen - 720p")
-    } else {
-        (FALLBACK_VIDEO_ASSET, "Big Buck Bunny - 720p")
-    };
-    let video_asset = app.asset_server().load(video_asset_name);
+    let video_asset = app.asset_server().load(VIDEO_ASSET);
     app.command_scope({
         let video = video.clone();
         move |mut commands| {
@@ -193,7 +186,7 @@ fn model(app: &App) -> AppModel {
         cuda_laser_path,
         laser,
         video,
-        video_label,
+        video_label: "JCVD green screen - 720p",
     })
 }
 
