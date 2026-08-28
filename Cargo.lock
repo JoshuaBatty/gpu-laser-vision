@@ -4216,6 +4216,7 @@ dependencies = [
  "cuda-device",
  "cuda-host",
  "image",
+ "lasy",
  "nannou",
  "nannou_laser",
  "tch",
