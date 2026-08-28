@@ -21,6 +21,7 @@ cuda-host = { git = "https://github.com/NVlabs/cuda-oxide", rev = "a105afd522b73
 cutile-cuda-async = { git = "https://github.com/NVlabs/cutile-rs", rev = "d0d2ba9a8a897f1ef03f9d4556747dc35d47d613", package = "cuda-async" }
 cutile-cuda-core = { git = "https://github.com/NVlabs/cutile-rs", rev = "d0d2ba9a8a897f1ef03f9d4556747dc35d47d613", package = "cuda-core" }
 image = "0.25"
+lasy = "0.4.1"
 nannou = { version = "0.20.0", features = ["egui", "video"] }
 nannou_laser = "0.20.0"
 # tch releases target one exact PyTorch C++ API version. This matches the

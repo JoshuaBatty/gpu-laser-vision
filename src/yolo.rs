@@ -110,6 +110,28 @@ impl YoloSegmenter {
     }
 }
 
+/// Replaces pixels outside the person mask with opaque black.
+///
+/// # Panics
+///
+/// Panics when the mask and source dimensions differ.
+pub fn isolate_person(source: &mut RgbaImage, person_mask: &GrayImage) {
+    assert_eq!(
+        source.dimensions(),
+        person_mask.dimensions(),
+        "person mask must match its source frame"
+    );
+    for (pixel, &mask) in source
+        .as_mut()
+        .chunks_exact_mut(4)
+        .zip(person_mask.as_raw())
+    {
+        if mask == 0 {
+            pixel.copy_from_slice(&[0, 0, 0, 255]);
+        }
+    }
+}
+
 /// Scale and padding needed to map model-space masks back to the source frame.
 #[derive(Clone, Copy)]
 struct LetterboxTransform {
@@ -497,7 +519,7 @@ fn tensor_output(value: IValue, name: &str) -> Result<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MaskBounds, colorize_contour, extract_contour};
+    use super::{MaskBounds, colorize_contour, extract_contour, isolate_person};
     use image::{GrayImage, Luma, Rgba, RgbaImage};
 
     #[test]
@@ -523,6 +545,19 @@ mod tests {
         assert_eq!(contour.get_pixel(3, 2)[0], 255);
         assert_eq!(contour.pixels().filter(|pixel| pixel[0] > 0).count(), 8);
         assert_eq!(contour_pixels, [6, 7, 8, 11, 13, 16, 17, 18]);
+    }
+
+    #[test]
+    fn person_isolation_blacks_only_the_background() {
+        let mut source = RgbaImage::from_pixel(2, 1, Rgba([20, 40, 60, 255]));
+        source.put_pixel(1, 0, Rgba([80, 100, 120, 255]));
+        let mut mask = GrayImage::new(2, 1);
+        mask.put_pixel(1, 0, Luma([255]));
+
+        isolate_person(&mut source, &mask);
+
+        assert_eq!(source.get_pixel(0, 0), &Rgba([0, 0, 0, 255]));
+        assert_eq!(source.get_pixel(1, 0), &Rgba([80, 100, 120, 255]));
     }
 
     #[test]

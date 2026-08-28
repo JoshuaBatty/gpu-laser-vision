@@ -12,7 +12,11 @@ mod path_generation;
 mod yolo;
 
 use bevy::app::{App as BevyApp, Plugin, PostUpdate};
-use bevy::window::{PrimaryWindow, Window};
+use bevy::camera::visibility::RenderLayers;
+use bevy::window::{
+    CursorOptions, Monitor, MonitorSelection, PresentMode, PrimaryWindow, Window, WindowPosition,
+    WindowResolution,
+};
 use nannou::prelude::bevy_asset::{Assets, RenderAssetUsages};
 use nannou::prelude::*;
 use std::{
@@ -24,6 +28,8 @@ const SOURCE_IMAGE: &str = "assets/test_tiles.png";
 const VIDEO_ASSET: &str = "jcvd_green_screen_720p.mp4";
 const PRESENTATION_WIDTH: u32 = 1280;
 const PRESENTATION_HEIGHT: u32 = 720;
+const PRESENTATION_ASPECT: f32 = 16.0 / 9.0;
+const PROJECTOR_RENDER_LAYER: usize = 31;
 type AppModel = Result<Model, String>;
 
 /// Long-lived application state shared by the renderer and video pipeline.
@@ -43,6 +49,49 @@ struct ImagePanel {
 struct EdgeThresholds {
     min: f32,
     max: f32,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum LaserSource {
+    #[default]
+    Cuda,
+    Yolo,
+}
+
+impl LaserSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cuda => "CUDA contour",
+            Self::Yolo => "YOLO contour",
+        }
+    }
+
+    const fn frame_profile(self) -> laser::FrameProfile {
+        match self {
+            Self::Cuda => laser::FrameProfile::DenseEdges,
+            Self::Yolo => laser::FrameProfile::Contour,
+        }
+    }
+}
+
+#[derive(Default)]
+struct InterfaceActions {
+    toggle_projector: bool,
+    laser_changed: bool,
+}
+
+#[derive(Default)]
+struct OutputState {
+    projector: Option<ProjectorOutput>,
+    laser_enabled: bool,
+    laser_source: LaserSource,
+}
+
+/// Entity pair owned by the optional isolated projector output.
+#[derive(Clone, Copy)]
+struct ProjectorOutput {
+    window: Entity,
+    camera: Entity,
 }
 
 /// Timings for one frame, an accumulated window, or its averaged snapshot.
@@ -104,7 +153,10 @@ impl Default for EdgeThresholds {
 
 /// Connects Bevy's video entity to state consumed by the nannou view.
 #[derive(Component, Clone)]
-struct VideoBridge(Arc<Mutex<VideoBridgeState>>);
+struct VideoBridge {
+    state: Arc<Mutex<VideoBridgeState>>,
+    laser: laser::LaserControl,
+}
 
 /// Latest video outputs and metrics published across the Bevy/nannou boundary.
 #[derive(Default)]
@@ -120,6 +172,7 @@ struct VideoBridgeState {
     interface_configured: bool,
     reported_first_frame: bool,
     thresholds: EdgeThresholds,
+    output: OutputState,
 }
 
 /// GPU resources reused across video frames.
@@ -131,6 +184,7 @@ struct VideoVisionPipeline {
 
 /// Display textures and laser paths produced for the latest video frame.
 struct ProcessedVideoFrame {
+    projector: ImagePanel,
     panels: [ImagePanel; 6],
     cuda_laser_path: path_generation::LaserPath,
     yolo_laser_path: path_generation::LaserPath,
@@ -142,7 +196,7 @@ struct VideoBridgePlugin;
 impl Plugin for VideoBridgePlugin {
     fn build(&self, app: &mut BevyApp) {
         app.insert_non_send(VideoVisionPipeline::default())
-            .add_systems(PostUpdate, process_video_frames);
+            .add_systems(PostUpdate, (process_video_frames, cleanup_closed_projector));
     }
 }
 
@@ -157,6 +211,8 @@ fn model(app: &App) -> AppModel {
     app.new_window::<AppModel>()
         .size(PRESENTATION_WIDTH, PRESENTATION_HEIGHT)
         .title("GPU Laser Vision")
+        .monitor(MonitorSelection::Primary)
+        .primary()
         .build();
 
     let images = edge_detection::process(SOURCE_IMAGE).map_err(|error| {
@@ -169,15 +225,19 @@ fn model(app: &App) -> AppModel {
         &images.edge_colors,
         &images.edge_pixels,
     );
-    let laser = laser::EtherDreamStream::start(&cuda_laser_path);
+    let laser = laser::EtherDreamStream::start();
     let video = Arc::new(Mutex::new(VideoBridgeState::default()));
     let video_asset = app.asset_server().load(VIDEO_ASSET);
     app.command_scope({
         let video = video.clone();
+        let laser = laser.control().clone();
         move |mut commands| {
             commands.spawn((
                 VideoPlayer::new(video_asset).with_mode(PlaybackMode::Loop),
-                VideoBridge(video),
+                VideoBridge {
+                    state: video,
+                    laser,
+                },
             ));
         }
     });
@@ -198,18 +258,7 @@ fn process_video_frames(
     mut pipeline: NonSendMut<VideoVisionPipeline>,
 ) {
     for (output, bridge) in &outputs {
-        // Publish the source texture immediately and adopt its dimensions once.
-        {
-            let mut video = lock_video(&bridge.0);
-            video.image = Some(output.image.clone());
-            if !video.window_sized
-                && let Ok(mut window) = windows.single_mut()
-            {
-                let source_size = output.size.as_vec2();
-                window.resolution.set(source_size.x, source_size.y);
-                video.window_sized = true;
-            }
-        }
+        publish_source_frame(output, bridge, &mut windows);
 
         let frame_started = Instant::now();
         let frame_copy_started = Instant::now();
@@ -222,8 +271,8 @@ fn process_video_frames(
             };
             image::RgbaImage::from_raw(output.size.x, output.size.y, pixels.clone())
         };
-        let Some(frame) = frame else {
-            lock_video(&bridge.0).error = Some("video frame dimensions are invalid".into());
+        let Some(mut frame) = frame else {
+            lock_video(&bridge.state).error = Some("video frame dimensions are invalid".into());
             continue;
         };
         let frame_copy_ms = frame_copy_started.elapsed().as_secs_f64() * 1_000.0;
@@ -233,7 +282,7 @@ fn process_video_frames(
             match yolo::YoloSegmenter::load(yolo::DEFAULT_MODEL_PATH) {
                 Ok(segmenter) => pipeline.yolo = Some(segmenter),
                 Err(error) => {
-                    lock_video(&bridge.0).error = Some(format!("YOLO setup failed: {error:#}"));
+                    lock_video(&bridge.state).error = Some(format!("YOLO setup failed: {error:#}"));
                     continue;
                 }
             }
@@ -247,12 +296,11 @@ fn process_video_frames(
         {
             Ok(frame) => frame,
             Err(error) => {
-                lock_video(&bridge.0).error = Some(format!("YOLO inference failed: {error:#}"));
+                lock_video(&bridge.state).error = Some(format!("YOLO inference failed: {error:#}"));
                 continue;
             }
         };
         let yolo_ms = yolo_started.elapsed().as_secs_f64() * 1_000.0;
-        let yolo_confidence = yolo_frame.confidence;
 
         let dimensions = (frame.width(), frame.height());
         // Rebuild the captured CUDA graph only when frame dimensions change.
@@ -265,7 +313,7 @@ fn process_video_frames(
             match edge_detection::CudaEdgeDetector::new(dimensions.0, dimensions.1) {
                 Ok(detector) => pipeline.detector = Some(detector),
                 Err(error) => {
-                    lock_video(&bridge.0).error =
+                    lock_video(&bridge.state).error =
                         Some(format!("CUDA graph setup failed: {error:#}"));
                     continue;
                 }
@@ -276,41 +324,62 @@ fn process_video_frames(
             .detector
             .as_mut()
             .expect("detector was initialized");
-        let thresholds = lock_video(&bridge.0).thresholds;
+        let thresholds = lock_video(&bridge.state).thresholds;
         let cuda_edges_started = Instant::now();
         let cuda_images = detector.process(&frame, thresholds.min, thresholds.max);
         let cuda_edges_ms = cuda_edges_started.elapsed().as_secs_f64() * 1_000.0;
         match cuda_images {
-            Ok(images) => publish_processed_frame(
-                &bridge.0,
-                &mut assets,
-                images,
-                yolo_frame,
-                yolo_confidence,
-                PipelineTimingSample {
-                    frame_copy_ms,
-                    yolo_ms,
-                    cuda_edges_ms,
-                    ..PipelineTimingSample::default()
-                },
-                frame_started,
-            ),
+            Ok(images) => {
+                yolo::isolate_person(&mut frame, &yolo_frame.person_mask);
+                publish_processed_frame(
+                    bridge,
+                    &mut assets,
+                    images,
+                    yolo_frame,
+                    frame,
+                    PipelineTimingSample {
+                        frame_copy_ms,
+                        yolo_ms,
+                        cuda_edges_ms,
+                        ..PipelineTimingSample::default()
+                    },
+                    frame_started,
+                );
+            }
             Err(error) => {
-                lock_video(&bridge.0).error = Some(format!("CUDA frame failed: {error:#}"));
+                lock_video(&bridge.state).error = Some(format!("CUDA frame failed: {error:#}"));
             }
         }
     }
 }
 
+fn publish_source_frame(
+    output: &VideoOutput,
+    bridge: &VideoBridge,
+    windows: &mut Query<&mut Window, With<PrimaryWindow>>,
+) {
+    let mut video = lock_video(&bridge.state);
+    video.image = Some(output.image.clone());
+    if !video.window_sized
+        && let Ok(mut window) = windows.single_mut()
+    {
+        let source_size = output.size.as_vec2();
+        window.resolution.set(source_size.x, source_size.y);
+        video.window_sized = true;
+    }
+}
+
+/// Publishes one coherent set of textures, paths, and timing data to the UI.
 fn publish_processed_frame(
-    video: &Mutex<VideoBridgeState>,
+    bridge: &VideoBridge,
     assets: &mut Assets<Image>,
     images: edge_detection::EdgeDetectionImages,
     yolo_frame: yolo::YoloFrame,
-    yolo_confidence: Option<f32>,
+    projector_frame: image::RgbaImage,
     mut timings: PipelineTimingSample,
     frame_started: Instant,
 ) {
+    let yolo_confidence = yolo_frame.confidence;
     let cuda_path_started = Instant::now();
     let cuda_laser_path = path_generation::from_edge_mask(
         &images.laser_edges,
@@ -328,7 +397,15 @@ fn publish_processed_frame(
     timings.yolo_path_ms = yolo_path_started.elapsed().as_secs_f64() * 1_000.0;
 
     // Publish one coherent frame before rolling the metrics window.
-    let mut video = lock_video(video);
+    let mut video = lock_video(&bridge.state);
+    if video.output.laser_enabled {
+        let source = video.output.laser_source;
+        let path = match source {
+            LaserSource::Cuda => &cuda_laser_path,
+            LaserSource::Yolo => &yolo_laser_path,
+        };
+        bridge.laser.set_path(path, source.frame_profile());
+    }
     let cuda_point_count = cuda_laser_path.point_count();
     let yolo_point_count = yolo_laser_path.point_count();
     let debug_upload_started = Instant::now();
@@ -337,11 +414,19 @@ fn publish_processed_frame(
             processed,
             images,
             yolo_frame,
+            projector_frame,
             cuda_laser_path,
             yolo_laser_path,
             assets,
         );
     } else {
+        let projector = ImagePanel {
+            image: assets.add(Image::from_dynamic(
+                image::DynamicImage::ImageRgba8(projector_frame),
+                true,
+                RenderAssetUsages::default(),
+            )),
+        };
         let panels = live_image_panels(images, yolo_frame, |image| {
             assets.add(Image::from_dynamic(
                 image,
@@ -350,6 +435,7 @@ fn publish_processed_frame(
             ))
         });
         video.processed = Some(ProcessedVideoFrame {
+            projector,
             panels,
             cuda_laser_path,
             yolo_laser_path,
@@ -359,7 +445,23 @@ fn publish_processed_frame(
     timings.total_ms = frame_started.elapsed().as_secs_f64() * 1_000.0;
     video.timing_totals += timings;
     video.error = None;
+    record_pipeline_metrics(
+        &mut video,
+        timings,
+        yolo_confidence,
+        cuda_point_count,
+        yolo_point_count,
+    );
+}
 
+/// Rolls per-frame timings into the dashboard's two-second metrics window.
+fn record_pipeline_metrics(
+    video: &mut VideoBridgeState,
+    timings: PipelineTimingSample,
+    yolo_confidence: Option<f32>,
+    cuda_point_count: usize,
+    yolo_point_count: usize,
+) {
     if !video.reported_first_frame {
         let detection = detection_label(yolo_confidence);
         println!(
@@ -416,6 +518,7 @@ fn update_processed_frame(
     processed: &mut ProcessedVideoFrame,
     images: edge_detection::EdgeDetectionImages,
     yolo_frame: yolo::YoloFrame,
+    projector_frame: image::RgbaImage,
     cuda_laser_path: path_generation::LaserPath,
     yolo_laser_path: path_generation::LaserPath,
     assets: &mut Assets<Image>,
@@ -423,6 +526,7 @@ fn update_processed_frame(
     processed.cuda_laser_path = cuda_laser_path;
     processed.yolo_laser_path = yolo_laser_path;
     let previews = images.previews;
+    update_rgba_panel(&mut processed.projector, projector_frame, assets);
 
     let [
         cuda_contour,
@@ -438,6 +542,22 @@ fn update_processed_frame(
     update_luma_panel(grayscale, previews.grayscale, assets);
     update_luma_panel(edges, previews.edges, assets);
     update_luma_panel(laser_edges, images.laser_edges, assets);
+}
+
+/// Updates an RGBA preview in place, replacing the asset only if its handle is stale.
+fn update_rgba_panel(panel: &mut ImagePanel, image: image::RgbaImage, assets: &mut Assets<Image>) {
+    if let Some(mut current) = assets.get_mut(&panel.image) {
+        let source = image.into_raw();
+        let target = current.data.get_or_insert_with(Vec::new);
+        target.clone_from(&source);
+        return;
+    }
+
+    panel.image = assets.add(Image::from_dynamic(
+        image::DynamicImage::ImageRgba8(image),
+        true,
+        RenderAssetUsages::default(),
+    ));
 }
 
 /// Updates an RGB preview in place, replacing the asset only if its handle is stale.
@@ -515,8 +635,11 @@ fn lock_video(video: &Mutex<VideoBridgeState>) -> MutexGuard<'_, VideoBridgeStat
 }
 
 fn view(app: &App, model: &AppModel, window_entity: Entity) {
-    let draw = app.draw();
-    let window = app.window_rect();
+    if window_entity != app.main_window().id() {
+        return;
+    }
+    let draw = app.draw_for_window(window_entity);
+    let window = app.window(window_entity).rect();
     draw.background().color(interface::background());
 
     let model = match model {
@@ -535,7 +658,16 @@ fn view(app: &App, model: &AppModel, window_entity: Entity) {
     };
     let mut video = lock_video(&model.video);
     let laser_status = model.laser.status();
-    let laser_accent = status_accent(&laser_status);
+    let laser_label = laser_output_label(
+        video.output.laser_enabled,
+        video.output.laser_source,
+        &laser_status,
+    );
+    let laser_accent = laser_output_accent(
+        video.output.laser_enabled,
+        video.output.laser_source,
+        &laser_status,
+    );
     let egui_context = app.egui_for_window(window_entity);
     if !video.interface_configured {
         interface::configure_egui(&egui_context);
@@ -554,15 +686,18 @@ fn view(app: &App, model: &AppModel, window_entity: Entity) {
         .resizable(false)
         .frame(interface::header_frame())
         .show_inside(&mut egui_viewport, |ui| {
-            draw_header(ui, video.metrics, &laser_status, laser_accent);
+            draw_header(ui, video.metrics, &laser_label, laser_accent);
         });
 
+    let mut actions = InterfaceActions::default();
     egui::Panel::left("control_rail")
         .exact_size(interface::SIDEBAR_WIDTH)
         .resizable(false)
         .frame(interface::sidebar_frame())
         .show_inside(&mut egui_viewport, |ui| {
-            draw_control_rail(ui, &mut video, model.video_label, &laser_status);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                actions = draw_control_rail(ui, &mut video, model.video_label, &laser_status);
+            });
         });
 
     let layout = interface::DashboardLayout::new(window);
@@ -572,6 +707,148 @@ fn view(app: &App, model: &AppModel, window_entity: Entity) {
     } else {
         draw_loading_dashboard(&draw, &layout, &model.cuda_laser_path);
     }
+
+    if actions.laser_changed {
+        apply_laser_settings(model.laser.control(), &video);
+    }
+    drop(video);
+    if actions.toggle_projector {
+        toggle_projector_window(app, &model.video);
+    }
+}
+
+/// Draws only the isolated person texture, cover-cropped to the projector.
+fn projector_view(app: &App, model: &AppModel) {
+    let Ok(model) = model else {
+        return;
+    };
+    let video = lock_video(&model.video);
+    let Some(window_entity) = video.output.projector.map(|projector| projector.window) else {
+        return;
+    };
+    let Some(image) = video
+        .processed
+        .as_ref()
+        .map(|frame| frame.projector.image.clone())
+    else {
+        return;
+    };
+    drop(video);
+
+    let draw = app.draw_for_window(window_entity);
+    let window = app.window(window_entity).rect();
+    draw.background().color(BLACK);
+    let (width, height) = if window.w() / window.h() > PRESENTATION_ASPECT {
+        (window.w(), window.w() / PRESENTATION_ASPECT)
+    } else {
+        (window.h() * PRESENTATION_ASPECT, window.h())
+    };
+    interface::draw_texture(
+        &draw,
+        &image,
+        interface::CardRect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        },
+    );
+}
+
+/// Creates or destroys the borderless window and camera on the second display.
+fn toggle_projector_window(app: &App, video: &Mutex<VideoBridgeState>) {
+    if let Some(projector) = lock_video(video).output.projector.take() {
+        app.command_scope(move |mut commands| {
+            commands.entity(projector.window).try_despawn();
+            commands.entity(projector.camera).try_despawn();
+        });
+        return;
+    }
+
+    let Some(monitor) = secondary_monitor(app) else {
+        eprintln!("Projector output requires a secondary display");
+        return;
+    };
+
+    let projector_layer = RenderLayers::layer(PROJECTOR_RENDER_LAYER);
+    let camera = app.new_camera().layer(projector_layer.clone()).build();
+    let projector = app
+        .new_window::<AppModel>()
+        .window(Window {
+            title: "GPU Laser Vision · Projector".into(),
+            position: WindowPosition::At(monitor.physical_position),
+            resolution: WindowResolution::new(monitor.physical_width, monitor.physical_height)
+                .with_scale_factor_override(1.0),
+            present_mode: PresentMode::Mailbox,
+            decorations: false,
+            resizable: false,
+            ..Window::default()
+        })
+        .camera(camera)
+        .view(projector_view)
+        .build();
+    app.command_scope(move |mut commands| {
+        commands.entity(projector).insert((
+            CursorOptions {
+                visible: false,
+                ..CursorOptions::default()
+            },
+            projector_layer.clone(),
+        ));
+        commands.entity(camera).insert(projector_layer);
+    });
+    lock_video(video).output.projector = Some(ProjectorOutput {
+        window: projector,
+        camera,
+    });
+}
+
+/// Selects the first monitor that is not Bevy's primary monitor.
+fn secondary_monitor(app: &App) -> Option<Monitor> {
+    let primary = app.primary_monitor();
+    let mut monitors = app.available_monitors().into_iter();
+    match primary {
+        Some(primary) => monitors
+            .find(|(entity, _)| *entity != primary)
+            .map(|(_, monitor)| monitor),
+        None => monitors.nth(1).map(|(_, monitor)| monitor),
+    }
+}
+
+/// Removes projector state and its camera after the window closes externally.
+fn cleanup_closed_projector(
+    bridges: Query<&VideoBridge>,
+    windows: Query<(), With<Window>>,
+    mut commands: Commands,
+) {
+    for bridge in &bridges {
+        let mut video = lock_video(&bridge.state);
+        let Some(projector) = video
+            .output
+            .projector
+            .filter(|projector| windows.get(projector.window).is_err())
+        else {
+            continue;
+        };
+
+        video.output.projector = None;
+        commands.entity(projector.camera).try_despawn();
+    }
+}
+
+/// Installs geometry before enabling output so the worker never exposes stale data.
+fn apply_laser_settings(control: &laser::LaserControl, video: &VideoBridgeState) {
+    if video.output.laser_enabled
+        && let Some(frame) = &video.processed
+    {
+        let source = video.output.laser_source;
+        let path = match source {
+            LaserSource::Cuda => &frame.cuda_laser_path,
+            LaserSource::Yolo => &frame.yolo_laser_path,
+        };
+        control.set_path(path, source.frame_profile());
+    }
+    control.set_enabled(video.output.laser_enabled);
 }
 
 fn draw_source_card(draw: &Draw, card: interface::CardRect, video: &VideoBridgeState) {
@@ -737,9 +1014,15 @@ fn draw_control_rail(
     ui: &mut egui::Ui,
     video: &mut VideoBridgeState,
     video_label: &str,
-    laser_status: &str,
-) {
+    laser_status: &laser::EtherDreamStatus,
+) -> InterfaceActions {
+    let mut actions = InterfaceActions::default();
     draw_threshold_controls(ui, &mut video.thresholds);
+
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(10.0);
+    draw_output_controls(ui, video, laser_status, &mut actions);
 
     ui.add_space(16.0);
     ui.separator();
@@ -765,8 +1048,11 @@ fn draw_control_rail(
     );
     interface::metric_row(
         ui,
-        "LASER",
-        state_text(laser_status, status_accent(laser_status)),
+        "ETHER DREAM",
+        state_text(
+            laser_status.state().label(),
+            connection_accent(laser_status),
+        ),
     );
 
     ui.add_space(16.0);
@@ -809,6 +1095,94 @@ fn draw_control_rail(
         ui.label(
             egui::RichText::new(error)
                 .size(10.0)
+                .color(interface::Accent::Error.ui_color()),
+        );
+    }
+
+    actions
+}
+
+fn draw_output_controls(
+    ui: &mut egui::Ui,
+    video: &mut VideoBridgeState,
+    laser_status: &laser::EtherDreamStatus,
+    actions: &mut InterfaceActions,
+) {
+    interface::section_label(ui, "OUTPUTS");
+    ui.add_space(6.0);
+
+    let projector_open = video.output.projector.is_some();
+    let projector_label = if projector_open {
+        "Close projector output"
+    } else {
+        "Open fullscreen projector"
+    };
+    let projector_button =
+        egui::Button::new(projector_label).min_size(egui::vec2(ui.available_width(), 30.0));
+    if ui.add(projector_button).clicked() {
+        actions.toggle_projector = true;
+    }
+
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new("Laser source")
+            .size(11.0)
+            .color(egui::Color32::from_rgb(121, 134, 144)),
+    );
+    let previous_source = video.output.laser_source;
+    egui::ComboBox::from_id_salt("laser_source")
+        .width(ui.available_width())
+        .selected_text(video.output.laser_source.label())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut video.output.laser_source,
+                LaserSource::Cuda,
+                LaserSource::Cuda.label(),
+            );
+            ui.selectable_value(
+                &mut video.output.laser_source,
+                LaserSource::Yolo,
+                LaserSource::Yolo.label(),
+            );
+        });
+    actions.laser_changed |= video.output.laser_source != previous_source;
+
+    let laser_label = if video.output.laser_enabled {
+        "Disable laser"
+    } else {
+        "Enable laser"
+    };
+    let mut laser_button =
+        egui::Button::new(laser_label).min_size(egui::vec2(ui.available_width(), 30.0));
+    if video.output.laser_enabled {
+        laser_button = laser_button.fill(egui::Color32::from_rgb(31, 92, 68));
+    }
+    if ui.add(laser_button).clicked() {
+        video.output.laser_enabled = !video.output.laser_enabled;
+        actions.laser_changed = true;
+    }
+
+    ui.add_space(6.0);
+    interface::metric_row(
+        ui,
+        "DAC",
+        state_text(
+            laser_status.device().unwrap_or("NOT DETECTED"),
+            connection_accent(laser_status),
+        ),
+    );
+    interface::metric_row(
+        ui,
+        "CONNECTION",
+        state_text(
+            laser_status.state().label(),
+            connection_accent(laser_status),
+        ),
+    );
+    if let Some(detail) = laser_status.detail() {
+        ui.label(
+            egui::RichText::new(detail)
+                .size(9.0)
                 .color(interface::Accent::Error.ui_color()),
         );
     }
@@ -912,14 +1286,49 @@ fn draw_loading_dashboard(
     }
 }
 
-fn status_accent(status: &str) -> interface::Accent {
-    let status = status.to_ascii_lowercase();
-    if status.contains("stream") || status.contains("ready") {
-        interface::Accent::Yolo
-    } else if status.contains("error") || status.contains("failed") {
-        interface::Accent::Error
+fn laser_output_label(
+    enabled: bool,
+    source: LaserSource,
+    status: &laser::EtherDreamStatus,
+) -> String {
+    if enabled && status.state() == laser::ConnectionState::Streaming {
+        return match source {
+            LaserSource::Cuda => "CUDA ON".into(),
+            LaserSource::Yolo => "YOLO ON".into(),
+        };
+    }
+    if enabled {
+        return format!("ARMED · {}", status.state().label());
+    }
+    if status.state() == laser::ConnectionState::Streaming {
+        "READY".into()
     } else {
-        interface::Accent::Neutral
+        status.state().label().into()
+    }
+}
+
+fn laser_output_accent(
+    enabled: bool,
+    source: LaserSource,
+    status: &laser::EtherDreamStatus,
+) -> interface::Accent {
+    if status.state() == laser::ConnectionState::Error {
+        interface::Accent::Error
+    } else if enabled {
+        match source {
+            LaserSource::Cuda => interface::Accent::Cuda,
+            LaserSource::Yolo => interface::Accent::Yolo,
+        }
+    } else {
+        connection_accent(status)
+    }
+}
+
+fn connection_accent(status: &laser::EtherDreamStatus) -> interface::Accent {
+    match status.state() {
+        laser::ConnectionState::Streaming => interface::Accent::Yolo,
+        laser::ConnectionState::Error => interface::Accent::Error,
+        _ => interface::Accent::Neutral,
     }
 }
 
